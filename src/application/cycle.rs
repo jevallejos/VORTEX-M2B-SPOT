@@ -47,6 +47,7 @@ pub enum CycleOutcome {
         drift_1e8: i128,
         shadow_4h_updated: bool,
         halted: bool,
+        drain_mode: bool,
     },
 }
 
@@ -83,11 +84,6 @@ impl<'a> RunHourlyCycleUseCase<'a> {
                 return Err(AppError::LiveSafetyLockDenied(
                     "BYBIT_SPOT_LIVE_EXECUTION=true and valid BYBIT_SPOT_ACK_LIVE required"
                         .to_string(),
-                ));
-            }
-            if self.store.has_drain_lock()? {
-                return Err(AppError::LiveSafetyLockDenied(
-                    "DRAIN_MODE.lock is active".to_string(),
                 ));
             }
             if self.store.has_halt_lock()? {
@@ -332,6 +328,12 @@ impl<'a> RunHourlyCycleUseCase<'a> {
                                 order_link_id: order_link_id.clone(),
                                 reference_price_1e8: ord.reference_price_1e8,
                             };
+                            guard_live_order_request(
+                                &req,
+                                drain_mode,
+                                halt_lock,
+                                ledger.is_halted(),
+                            )?;
                             self.exec.execute_spot_order(&req)?
                         }
                     };
@@ -423,13 +425,14 @@ impl<'a> RunHourlyCycleUseCase<'a> {
 
         if orders_executed > 0 {
             let _ = self.notifier.send_message(&format!(
-                "[VORTEX-M2B-SPOT {}] hour={} orders={} equity={} USDT drift={} halted={}",
+                "[VORTEX-M2B-SPOT {}] hour={} orders={} equity={} USDT drift={} halted={} drain_mode={}",
                 cfg.mode,
                 closed_hour_ts_ms,
                 orders_executed,
                 equity_1e8.format_fixed(2),
                 drift_1e8,
-                ledger.is_halted()
+                ledger.is_halted(),
+                drain_mode
             ));
         }
 
@@ -454,6 +457,7 @@ impl<'a> RunHourlyCycleUseCase<'a> {
             drift_1e8,
             shadow_4h_updated,
             halted: ledger.is_halted(),
+            drain_mode,
         })
     }
 
@@ -837,6 +841,20 @@ fn simulate_paper_orders(
     Ok((count, audits))
 }
 
+fn guard_live_order_request(
+    req: &OrderRequest,
+    drain_mode: bool,
+    halt_lock: bool,
+    ledger_halted: bool,
+) -> Result<(), AppError> {
+    if req.side == OrderSide::Buy && (drain_mode || halt_lock || ledger_halted) {
+        return Err(AppError::LiveSafetyLockDenied(
+            "buy order rejected: drain_mode or halt is active".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn apply_live_fill(
     ledger: &mut SpotPortfolioLedger,
     fill: &crate::domain::types::FillReport,
@@ -1059,6 +1077,7 @@ mod tests {
             drift_1e8,
             shadow_4h_updated,
             halted,
+            drain_mode,
             ..
         } = first
         {
@@ -1067,6 +1086,7 @@ mod tests {
             assert_eq!(drift_1e8, 0);
             assert!(shadow_4h_updated);
             assert!(!halted);
+            assert!(!drain_mode);
         }
 
         let msg_count_after_first = notifier.msgs.lock().map(|g| g.len()).unwrap_or(0);
@@ -1107,5 +1127,72 @@ mod tests {
 
         let res = uc.run(&cfg);
         assert!(matches!(res, Err(AppError::LiveSafetyLockDenied(_))));
+    }
+
+    #[test]
+    fn defensive_buy_guard_blocks_buys_under_drain_or_halt_and_permits_sells() {
+        let buy_req = OrderRequest {
+            symbol: Symbol::BtcUsdt,
+            side: OrderSide::Buy,
+            quote_spend_1e8: Money1e8(10_000_000_000),
+            base_qty_1e8: Qty1e8(10_000_000),
+            base_precision: Qty1e8(100_000),
+            order_link_id: "m2b_1700000000000_BTCUSDT_buy".to_string(),
+            reference_price_1e8: Price1e8(100_000_000_000),
+        };
+        let sell_req = OrderRequest {
+            symbol: Symbol::BtcUsdt,
+            side: OrderSide::Sell,
+            quote_spend_1e8: Money1e8(10_000_000_000),
+            base_qty_1e8: Qty1e8(10_000_000),
+            base_precision: Qty1e8(100_000),
+            order_link_id: "m2b_1700000000000_BTCUSDT_sell".to_string(),
+            reference_price_1e8: Price1e8(100_000_000_000),
+        };
+
+        assert!(guard_live_order_request(&buy_req, false, false, false).is_ok());
+        assert!(matches!(
+            guard_live_order_request(&buy_req, true, false, false),
+            Err(AppError::LiveSafetyLockDenied(_))
+        ));
+        assert!(matches!(
+            guard_live_order_request(&buy_req, false, true, false),
+            Err(AppError::LiveSafetyLockDenied(_))
+        ));
+        assert!(matches!(
+            guard_live_order_request(&buy_req, false, false, true),
+            Err(AppError::LiveSafetyLockDenied(_))
+        ));
+
+        assert!(guard_live_order_request(&sell_req, false, false, false).is_ok());
+        assert!(guard_live_order_request(&sell_req, true, false, false).is_ok());
+        assert!(guard_live_order_request(&sell_req, false, true, false).is_ok());
+        assert!(guard_live_order_request(&sell_req, false, false, true).is_ok());
+    }
+
+    #[test]
+    fn live_spot_halt_lock_rejects_cycle_fail_closed() {
+        let clock = FixedClock(1_700_000_000_000);
+        let market = MockMarket {
+            server_time_ms: 1_700_000_000_000,
+            candles: Vec::new(),
+        };
+        let exec = PaperNoopExecutionPort;
+        let store = MemStore::default();
+        assert!(store.write_halt_lock("manual halt test").is_ok());
+        let notifier = MemNotifier::default();
+        let uc = RunHourlyCycleUseCase::new(&clock, &market, &exec, &store, &notifier);
+
+        let cfg = CycleConfig {
+            mode: ExecutionMode::LiveSpot,
+            paper_initial_cash_1e8: Money1e8(100_000_000_000),
+            live_execution_env_flag: true,
+            live_ack_valid: true,
+            max_clock_skew_ms: 2_000,
+            recv_window_ms: 5_000,
+        };
+
+        let res = uc.run(&cfg);
+        assert!(matches!(res, Err(AppError::HaltLockActive(_))));
     }
 }

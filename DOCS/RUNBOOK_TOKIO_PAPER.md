@@ -157,10 +157,14 @@ journalctl -u vortex-m2b-spot.service --since "24 hours ago" -p err --no-pager
 
 ## 7. Procedimientos de Emergencia (`DRAIN_MODE.lock` y `HALT_LOCK`)
 
-### 7.1 `DRAIN_MODE.lock` (Drenaje ordenado: bloquea nuevas compras, permite ventas de salida)
+### 7.1 `DRAIN_MODE.lock` (Drenaje ordenado unificado: bloquea nuevas compras, permite ventas de salida)
 
-- **Efecto en `--paper`:** `allow_buys` pasa a `false` (`src/application/cycle.rs:268`). El motor **no abre ni amplía posiciones** (`Buy` bloqueadas), pero **sí ejecuta ventas de salida** (`Sell`) cuando el rebalanceador o el umbral de liquidación lo requieren.
-- **Efecto en `--live-spot`:** Bloquea la ejecución live en la puerta de seguridad (`AppError::LiveSafetyLockDenied("DRAIN_MODE.lock is active")`, `src/application/cycle.rs:88-92`).
+- **Efecto unificado en `--paper` y `--live-spot`:**
+  - `DRAIN_MODE.lock` **no aborta** el ciclo horario en ningún modo.
+  - `allow_buys` pasa estrictamente a `false` (`src/application/cycle.rs:264`), y en `--live-spot` una guarda defensiva adicional (`guard_live_order_request`, `src/application/cycle.rs:331-336,844-856`) rechaza cualquier orden `Buy` antes de invocar `SpotExecutionPort::execute_spot_order`. El motor **no abre ni amplía posiciones** (`0` órdenes `Buy`).
+  - Las órdenes de salida o reducción (`Sell`) planificadas por caída de señal (`TSMOM` negativo / `LIQUIDATE_TARGET_THRESH`) **sí se ejecutan normalmente** en ambos modos, preservando idempotencia `orderLinkId`, conciliación de wallet en `--live-spot` y `Drift == 0`.
+  - La salida `CYCLE_EXECUTED` (`src/main.rs:78-87`) y las alertas Telegram (`src/application/cycle.rs:426-437`) reportan explícitamente `drain_mode=true/false`.
+  - `HALT_LOCK` (Sección 7.2) y el Double Safety Lock continúan siendo paradas duras fail-closed absolutas.
 
 **Activar `DRAIN_MODE.lock`:**
 ```bash
@@ -177,10 +181,10 @@ vspot status
 ### 7.2 `HALT_LOCK` (Parada dura por Drawdown TWR `> 25%`, discrepancia de conciliación o intervención manual)
 
 - **Cuándo se activa automáticamente:**
-  1. Drawdown TWR estrictamente superior al `25%` (`dd_1e10 > 2_500_000_000`, `src/domain/accounting.rs:7,565`), escribiendo `state/HALT_LOCK` y evento `HARD_DRAWDOWN_HALT` (`src/application/cycle.rs:460-503`).
-  2. Discrepancia de saldo base `> base_precision` en conciliación `--live-spot` (`src/application/cycle.rs:213-247`), escribiendo `state/HALT_LOCK` y evento `RECONCILIATION_MISMATCH`.
+  1. Drawdown TWR estrictamente superior al `25%` (`dd_1e10 > 2_500_000_000`, `src/domain/accounting.rs:7,565`), escribiendo `state/HALT_LOCK` y evento `HARD_DRAWDOWN_HALT` (`src/application/cycle.rs:464-507`).
+  2. Discrepancia de saldo base `> base_precision` en conciliación `--live-spot` (`src/application/cycle.rs:209-243`), escribiendo `state/HALT_LOCK` y evento `RECONCILIATION_MISMATCH`.
 - **Efecto en `--paper`:** `allow_buys = false`, `ledger.is_halted() = true`; las ventas de liquidación siguen siendo evaluables si la señal cae por debajo del umbral, pero no hay nuevas compras.
-- **Efecto en `--live-spot`:** Rechazo inmediato fail-closed (`AppError::HaltLockActive`, `src/application/cycle.rs:93-95`).
+- **Efecto en `--live-spot`:** Rechazo inmediato fail-closed (`AppError::HaltLockActive`, `src/application/cycle.rs:89-91`).
 
 **Activar manualmente `HALT_LOCK`:**
 ```bash

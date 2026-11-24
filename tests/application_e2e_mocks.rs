@@ -11,9 +11,10 @@ use vortex_m2b_spot::domain::ports::{
     ClockPort, MarketDataPort, NotifierPort, RunLockGuard, SpotExecutionPort, StateStorePort,
 };
 use vortex_m2b_spot::domain::types::{
-    AuditEntry, Candle, EnginePersistedState, ExecutionMode, FillReport, InstrumentRules, Money1e8,
-    OrderRequest, Price1e8, Qty1e8, Shadow4hPersistedState, Symbol, TickerSnapshot, WalletSnapshot,
-    ONE_HOUR_MS, UNIVERSE_LEN,
+    make_order_link_id, mul_div_floor_nonneg, mul_div_round, AuditEntry, Candle,
+    EnginePersistedState, ExecutionMode, FillReport, InstrumentRules, Money1e8, OrderRequest,
+    OrderSide, Price1e8, Qty1e8, Shadow4hPersistedState, Symbol, TickerSnapshot, WalletSnapshot,
+    ONE_HOUR_MS, SCALE_1E8, UNIVERSE_LEN,
 };
 use vortex_m2b_spot::infrastructure::bybit_spot_v5::sign_bybit_v5;
 use vortex_m2b_spot::infrastructure::config::AppConfig;
@@ -215,6 +216,200 @@ impl SpotExecutionPort for SpyExecutionPort {
     }
 }
 
+struct MockLiveExecutionPort {
+    wallet: Mutex<WalletSnapshot>,
+    submitted: Mutex<Vec<OrderRequest>>,
+    fills: Mutex<HashMap<String, FillReport>>,
+    seq: AtomicUsize,
+}
+
+impl MockLiveExecutionPort {
+    fn new(initial_usdt_1e8: Money1e8, fetched_at_ms: i64) -> Self {
+        Self {
+            wallet: Mutex::new(WalletSnapshot {
+                usdt_free_1e8: initial_usdt_1e8,
+                usdt_locked_1e8: Money1e8::ZERO,
+                coin_free_1e8: [Qty1e8::ZERO; UNIVERSE_LEN],
+                coin_locked_1e8: [Qty1e8::ZERO; UNIVERSE_LEN],
+                fetched_at_ms,
+            }),
+            submitted: Mutex::new(Vec::new()),
+            fills: Mutex::new(HashMap::new()),
+            seq: AtomicUsize::new(1),
+        }
+    }
+
+    fn set_wallet_ts(&self, ts_ms: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = self
+            .wallet
+            .lock()
+            .map_err(|_| "mock live wallet mutex poisoned")?;
+        g.fetched_at_ms = ts_ms;
+        Ok(())
+    }
+
+    fn wallet_snapshot(&self) -> Result<WalletSnapshot, Box<dyn std::error::Error>> {
+        let g = self
+            .wallet
+            .lock()
+            .map_err(|_| "mock live wallet mutex poisoned")?;
+        Ok(g.clone())
+    }
+
+    fn submitted_orders(&self) -> Result<Vec<OrderRequest>, Box<dyn std::error::Error>> {
+        let g = self
+            .submitted
+            .lock()
+            .map_err(|_| "mock live submitted mutex poisoned")?;
+        Ok(g.clone())
+    }
+
+    fn clear_submitted_orders(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = self
+            .submitted
+            .lock()
+            .map_err(|_| "mock live submitted mutex poisoned")?;
+        g.clear();
+        Ok(())
+    }
+
+    fn fill_by_link_id(
+        &self,
+        order_link_id: &str,
+    ) -> Result<Option<FillReport>, Box<dyn std::error::Error>> {
+        let g = self
+            .fills
+            .lock()
+            .map_err(|_| "mock live fills mutex poisoned")?;
+        Ok(g.get(order_link_id).cloned())
+    }
+}
+
+impl SpotExecutionPort for MockLiveExecutionPort {
+    fn fetch_wallet_snapshot(&self) -> Result<WalletSnapshot, InfraError> {
+        self.wallet
+            .lock()
+            .map(|g| g.clone())
+            .map_err(|_| InfraError::Io("mock live wallet mutex poisoned".to_string()))
+    }
+
+    fn query_order_by_link_id(
+        &self,
+        _symbol: Symbol,
+        order_link_id: &str,
+    ) -> Result<Option<FillReport>, InfraError> {
+        let g = self
+            .fills
+            .lock()
+            .map_err(|_| InfraError::Io("mock live fills mutex poisoned".to_string()))?;
+        Ok(g.get(order_link_id).cloned())
+    }
+
+    fn execute_spot_order(&self, req: &OrderRequest) -> Result<FillReport, InfraError> {
+        {
+            let mut sub = self
+                .submitted
+                .lock()
+                .map_err(|_| InfraError::Io("mock live submitted mutex poisoned".to_string()))?;
+            sub.push(req.clone());
+        }
+
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let order_id = format!("mock_order_{seq}");
+        let idx = req.symbol.index();
+
+        let mut wallet = self
+            .wallet
+            .lock()
+            .map_err(|_| InfraError::Io("mock live wallet mutex poisoned".to_string()))?;
+
+        let fill = match req.side {
+            OrderSide::Buy => {
+                let quote_spent = req.quote_spend_1e8;
+                let gross_base = Qty1e8(
+                    mul_div_floor_nonneg(
+                        quote_spent.raw(),
+                        SCALE_1E8,
+                        req.reference_price_1e8.raw(),
+                    )
+                    .map_err(|e| InfraError::Parse(e.to_string()))?,
+                );
+                let fee_base = Qty1e8(
+                    mul_div_floor_nonneg(gross_base.raw(), 10, 10_000)
+                        .map_err(|e| InfraError::Parse(e.to_string()))?,
+                );
+                let net_base = gross_base
+                    .checked_sub(fee_base)
+                    .and_then(|q| q.floor_to_step(req.base_precision))
+                    .map_err(|e| InfraError::Parse(e.to_string()))?;
+
+                wallet.usdt_free_1e8 = wallet
+                    .usdt_free_1e8
+                    .checked_sub(quote_spent)
+                    .map_err(|e| InfraError::Parse(e.to_string()))?;
+                wallet.coin_free_1e8[idx] = wallet.coin_free_1e8[idx]
+                    .checked_add(net_base)
+                    .map_err(|e| InfraError::Parse(e.to_string()))?;
+
+                FillReport {
+                    symbol: req.symbol,
+                    side: OrderSide::Buy,
+                    order_id,
+                    order_link_id: req.order_link_id.clone(),
+                    exec_qty_base_1e8: gross_base,
+                    exec_quote_1e8: quote_spent,
+                    avg_price_1e8: req.reference_price_1e8,
+                    fee_1e8: fee_base.raw(),
+                    fee_in_base: true,
+                    filled_at_ms: wallet.fetched_at_ms,
+                }
+            }
+            OrderSide::Sell => {
+                let sell_qty = req.base_qty_1e8;
+                let gross_quote = Money1e8(
+                    mul_div_floor_nonneg(sell_qty.raw(), req.reference_price_1e8.raw(), SCALE_1E8)
+                        .map_err(|e| InfraError::Parse(e.to_string()))?,
+                );
+                let fee_usdt = Money1e8(
+                    mul_div_round(gross_quote.raw(), 10, 10_000)
+                        .map_err(|e| InfraError::Parse(e.to_string()))?,
+                );
+                let net_quote = gross_quote
+                    .checked_sub(fee_usdt)
+                    .map_err(|e| InfraError::Parse(e.to_string()))?;
+
+                wallet.coin_free_1e8[idx] = wallet.coin_free_1e8[idx]
+                    .checked_sub(sell_qty)
+                    .map_err(|e| InfraError::Parse(e.to_string()))?;
+                wallet.usdt_free_1e8 = wallet
+                    .usdt_free_1e8
+                    .checked_add(net_quote)
+                    .map_err(|e| InfraError::Parse(e.to_string()))?;
+
+                FillReport {
+                    symbol: req.symbol,
+                    side: OrderSide::Sell,
+                    order_id,
+                    order_link_id: req.order_link_id.clone(),
+                    exec_qty_base_1e8: sell_qty,
+                    exec_quote_1e8: gross_quote,
+                    avg_price_1e8: req.reference_price_1e8,
+                    fee_1e8: fee_usdt.raw(),
+                    fee_in_base: false,
+                    filled_at_ms: wallet.fetched_at_ms,
+                }
+            }
+        };
+
+        let mut fills = self
+            .fills
+            .lock()
+            .map_err(|_| InfraError::Io("mock live fills mutex poisoned".to_string()))?;
+        fills.insert(req.order_link_id.clone(), fill.clone());
+        Ok(fill)
+    }
+}
+
 struct DummyLockGuard;
 impl RunLockGuard for DummyLockGuard {}
 
@@ -322,6 +517,14 @@ impl SpyNotifier {
             .lock()
             .map_err(|_| "notifier mutex poisoned")?;
         Ok(g.len())
+    }
+
+    fn messages_snapshot(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let g = self
+            .messages
+            .lock()
+            .map_err(|_| "notifier mutex poisoned")?;
+        Ok(g.clone())
     }
 }
 
@@ -536,20 +739,7 @@ fn live_spot_double_safety_lock_and_lockfile_rejections() -> TestResult {
         Err(AppError::LiveSafetyLockDenied(_))
     ));
 
-    // 3) Active DRAIN_MODE.lock -> LiveSafetyLockDenied
-    store.set_drain_lock(true)?;
-    let res_drain = uc.run(&CycleConfig {
-        mode: ExecutionMode::LiveSpot,
-        paper_initial_cash_1e8: Money1e8(100_000_000_000),
-        live_execution_env_flag: true,
-        live_ack_valid: true,
-        max_clock_skew_ms: 2_000,
-        recv_window_ms: 5_000,
-    });
-    assert!(matches!(res_drain, Err(AppError::LiveSafetyLockDenied(_))));
-    store.set_drain_lock(false)?;
-
-    // 4) Active HALT_LOCK -> HaltLockActive
+    // 3) Active HALT_LOCK -> HaltLockActive
     store.write_halt_lock("manual test halt")?;
     let res_halt = uc.run(&CycleConfig {
         mode: ExecutionMode::LiveSpot,
@@ -560,6 +750,21 @@ fn live_spot_double_safety_lock_and_lockfile_rejections() -> TestResult {
         recv_window_ms: 5_000,
     });
     assert!(matches!(res_halt, Err(AppError::HaltLockActive(_))));
+
+    // 4) Active DRAIN_MODE.lock + HALT_LOCK -> HALT_LOCK still fails closed
+    store.set_drain_lock(true)?;
+    let res_drain_and_halt = uc.run(&CycleConfig {
+        mode: ExecutionMode::LiveSpot,
+        paper_initial_cash_1e8: Money1e8(100_000_000_000),
+        live_execution_env_flag: true,
+        live_ack_valid: true,
+        max_clock_skew_ms: 2_000,
+        recv_window_ms: 5_000,
+    });
+    assert!(matches!(
+        res_drain_and_halt,
+        Err(AppError::HaltLockActive(_))
+    ));
     assert_eq!(exec.total_calls(), 0);
 
     Ok(())
@@ -603,10 +808,12 @@ fn drain_mode_in_paper_blocks_new_buys_and_allows_exit_sells() -> TestResult {
         CycleOutcome::Executed {
             orders_executed,
             drift_1e8,
+            drain_mode,
             ..
         } => {
             assert_eq!(orders_executed, 0, "DRAIN_MODE must block all new buys");
             assert_eq!(drift_1e8, 0);
+            assert!(drain_mode);
         }
         other => return Err(format!("expected Executed at hour2, got {other:?}").into()),
     }
@@ -639,19 +846,175 @@ fn drain_mode_in_paper_blocks_new_buys_and_allows_exit_sells() -> TestResult {
         CycleOutcome::Executed {
             orders_executed,
             drift_1e8,
+            drain_mode,
             ..
         } => {
             assert_eq!(orders_executed, 1, "DRAIN_MODE must permit exit Sell");
             assert_eq!(drift_1e8, 0);
+            assert!(drain_mode);
         }
         other => return Err(format!("expected Executed at hour3, got {other:?}").into()),
     }
+
+    let alerts = notifier.messages_snapshot()?;
+    assert!(
+        alerts.iter().any(|m| m.contains("drain_mode=true")),
+        "expected Telegram alert to include drain_mode=true, got {alerts:?}"
+    );
 
     let state_after = store
         .load_primary_state()?
         .ok_or("missing primary state after exit sell")?;
     assert_eq!(state_after.portfolio.positions[0].qty_1e8, Qty1e8::ZERO);
     assert_eq!(exec.total_calls(), 0);
+
+    Ok(())
+}
+
+#[test]
+fn drain_mode_in_live_spot_blocks_new_buys_and_executes_exit_sells() -> TestResult {
+    let dir = TempDirGuard::create("drain_live_spot")?;
+    let store = FsStateStore::new(dir.path().join("state"), dir.path().join("logs"))?;
+    let live_cfg = CycleConfig {
+        mode: ExecutionMode::LiveSpot,
+        paper_initial_cash_1e8: Money1e8(100_000_000_000),
+        live_execution_env_flag: true,
+        live_ack_valid: true,
+        max_clock_skew_ms: 2_000,
+        recv_window_ms: 5_000,
+    };
+
+    // Hour 1 (no DRAIN_MODE.lock): only BTCUSDT in uptrend -> opens BTC position via live Buy
+    let hour1_close = BASE_UTC_MIDNIGHT_MS + 603 * ONE_HOUR_MS;
+    let clock = MockClock::new(hour1_close + 1_000);
+    let market = MockMarket::new(hour1_close + 1_000, build_universe(603, 1));
+    let exec = MockLiveExecutionPort::new(Money1e8(100_000_000_000), hour1_close + 1_000);
+    let notifier = SpyNotifier::default();
+    let uc = RunHourlyCycleUseCase::new(&clock, &market, &exec, &store, &notifier);
+
+    let out1 = uc.run(&live_cfg)?;
+    match out1 {
+        CycleOutcome::Executed {
+            closed_hour_ts_ms,
+            orders_executed,
+            drift_1e8,
+            halted,
+            drain_mode,
+            ..
+        } => {
+            assert_eq!(closed_hour_ts_ms, hour1_close);
+            assert_eq!(orders_executed, 1);
+            assert_eq!(drift_1e8, 0);
+            assert!(!halted);
+            assert!(!drain_mode);
+        }
+        other => return Err(format!("expected Executed at hour1, got {other:?}").into()),
+    }
+
+    let state_before_drain = store
+        .load_primary_state()?
+        .ok_or("missing primary state after hour1")?;
+    let cash_before_drain = state_before_drain.portfolio.cash_1e8;
+    assert!(
+        state_before_drain.portfolio.positions[0].qty_1e8 > Qty1e8::ZERO,
+        "expected BTCUSDT position opened in hour1"
+    );
+    exec.clear_submitted_orders()?;
+
+    // Activate DRAIN_MODE.lock on disk
+    fs::write(
+        store.state_dir().join("DRAIN_MODE.lock"),
+        b"reason=live_drain_test\n",
+    )?;
+    assert!(store.has_drain_lock()?);
+
+    // Hour 2 (with DRAIN_MODE.lock):
+    // - BTCUSDT flips to downtrend (signal drops to 0.0 -> requires exit Sell)
+    // - ETHUSDT switches to strong uptrend (signal positive -> would require Buy, MUST be blocked)
+    let hour2_close = BASE_UTC_MIDNIGHT_MS + 604 * ONE_HOUR_MS;
+    let hour2_universe: [Vec<Candle>; UNIVERSE_LEN] = std::array::from_fn(|i| match i {
+        1 => build_uptrend_1h(604, 105.0, 0.15),
+        _ => build_uptrend_1h(604, 200.0, -0.05),
+    });
+
+    clock.set(hour2_close + 1_000)?;
+    market.set_state(hour2_close + 1_000, hour2_universe)?;
+    exec.set_wallet_ts(hour2_close + 1_000)?;
+
+    let out2 = uc.run(&live_cfg)?;
+    match out2 {
+        CycleOutcome::Executed {
+            closed_hour_ts_ms,
+            orders_executed,
+            drift_1e8,
+            halted,
+            drain_mode,
+            ..
+        } => {
+            assert_eq!(closed_hour_ts_ms, hour2_close);
+            assert_eq!(
+                orders_executed, 1,
+                "DRAIN_MODE in live-spot must execute only the exit Sell"
+            );
+            assert_eq!(drift_1e8, 0);
+            assert!(!halted);
+            assert!(drain_mode);
+        }
+        other => return Err(format!("expected Executed at hour2, got {other:?}").into()),
+    }
+
+    let submitted_h2 = exec.submitted_orders()?;
+    assert_eq!(
+        submitted_h2.len(),
+        1,
+        "SpotExecutionPort must receive strictly 1 order (exit Sell), got {submitted_h2:?}"
+    );
+    let expected_link_id = make_order_link_id(hour2_close, Symbol::BtcUsdt, OrderSide::Sell);
+    assert_eq!(submitted_h2[0].symbol, Symbol::BtcUsdt);
+    assert_eq!(submitted_h2[0].side, OrderSide::Sell);
+    assert_eq!(submitted_h2[0].order_link_id, expected_link_id);
+    assert!(
+        submitted_h2.iter().all(|o| o.side != OrderSide::Buy),
+        "DRAIN_MODE in live-spot must submit 0 Buy orders"
+    );
+    assert!(exec.fill_by_link_id(&expected_link_id)?.is_some());
+
+    let state_after = store
+        .load_primary_state()?
+        .ok_or("missing primary state after hour2")?;
+    assert_eq!(state_after.last_target_weights[0], 0.0);
+    assert!(
+        state_after.last_target_weights[1] >= 0.08,
+        "expected strong positive target weight on ETHUSDT, got {}",
+        state_after.last_target_weights[1]
+    );
+    assert_eq!(state_after.portfolio.positions[0].qty_1e8, Qty1e8::ZERO);
+    assert_eq!(state_after.portfolio.positions[1].qty_1e8, Qty1e8::ZERO);
+    assert!(
+        state_after.portfolio.cash_1e8 > cash_before_drain,
+        "cash must increase after exit Sell proceeds"
+    );
+    assert_eq!(
+        state_after.portfolio.cash_1e8,
+        exec.wallet_snapshot()?.usdt_free_1e8
+    );
+    assert_eq!(state_after.last_drift_1e8, 0);
+
+    let alerts = notifier.messages_snapshot()?;
+    assert!(
+        alerts.iter().any(|m| m.contains("live-spot")
+            && m.contains("orders=1")
+            && m.contains("drain_mode=true")),
+        "expected Telegram alert with live-spot orders=1 and drain_mode=true, got {alerts:?}"
+    );
+
+    let raw_ledger = fs::read_to_string(store.logs_dir().join("m2b_audit_ledger.jsonl"))?;
+    let lines: Vec<&str> = raw_ledger.lines().collect();
+    assert!(!lines.is_empty());
+    for line in lines {
+        assert!(verify_audit_ledger_line(line)?);
+        assert!(line.contains("\"drift_1e8\":0"));
+    }
 
     Ok(())
 }

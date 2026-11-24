@@ -73,16 +73,18 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             drift_1e8,
             shadow_4h_updated,
             halted,
+            drain_mode,
         }) => {
             println!(
-                "CYCLE_EXECUTED mode={} closed_hour_ts_ms={} orders={} equity_usdt={} drift_1e8={} shadow_4h_updated={} halted={}",
+                "CYCLE_EXECUTED mode={} closed_hour_ts_ms={} orders={} equity_usdt={} drift_1e8={} shadow_4h_updated={} halted={} drain_mode={}",
                 mode,
                 closed_hour_ts_ms,
                 orders_executed,
                 equity_1e8.format_fixed(2),
                 drift_1e8,
                 shadow_4h_updated,
-                halted
+                halted,
+                drain_mode
             );
             Ok(())
         }

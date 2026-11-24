@@ -175,34 +175,38 @@ Se garantiza $w_i^{\text{target}} \in [0, 0.40]$ (cero cortos) y $\sum_{i=0}^{4}
 
 ### 3.3 Máquina de Estados Finitos (FSM) del Ciclo Horario (`RunHourlyCycleUseCase::run`)
 
-Secuencia determinista en `src/application/cycle.rs:78-458`:
+Secuencia determinista en `src/application/cycle.rs:79-462`:
 
-1. **`ACQUIRE_RUN_LOCK` (`:79`)**: `FsStateStore::acquire_run_lock` crea `state/run.lock` con `OpenOptions::create_new(true)` (`O_CREAT | O_EXCL`, `state_store.rs:95-124`). Si ya existe retorna `InfraError::LockBusy`; el guard RAII `FsRunLockGuard::drop` elimina el archivo al salir de ámbito.
-2. **`LIVE_SAFETY_PREGATE` (`:81-96`)**: si `mode == LiveSpot`, verifica Double Safety Lock, ausencia de `DRAIN_MODE.lock` y ausencia de `HALT_LOCK`.
-3. **`CLOCK_SKEW_GUARD` (`:98-107`)**: consulta `/v5/market/time` y `clock.now_ms()`; si `|local - server| > max_clock_skew_ms` (default `2000 ms`) aborta con `InfraError::ClockSkew`.
-4. **`INGEST_AND_ALIGN` (`:109-132`)**: descarga `instruments-info`, `tickers` (`last > 0`) y `700` velas `1h` por símbolo; filtra estrictamente velas cerradas (`filter_strictly_closed_1h`) y alinea los 5 pares al último timestamp común (`align_candles_to_common_latest`, mínimo `600` velas cerradas `1h`).
-5. **`IDEMPOTENCY_GATE` (`:134-139`)**: si `closed_hour_ts_ms <= prev_state.last_processed_hour_ts_ms`, retorna `CycleOutcome::AlreadyProcessed` sin emitir órdenes, ledger ni alertas.
-6. **`LOAD_OR_BOOTSTRAP_LEDGER` (`:141-162`)**: carga `state/primary_state.json` (validando `assert_book_zero_drift`) o inicializa libro nuevo (`Paper`: `paper_initial_cash_1e8`; `LiveSpot`: `init_live_ledger_from_wallet` desde `UNIFIED` wallet).
-7. **`LOCKFILE_EVAL` (`:164-165`)**: evalúa `DRAIN_MODE.lock` y `HALT_LOCK`.
-8. **`LIVE_WALLET_RECONCILE` (`:167-248`, solo `LiveSpot`)**: llama `reconcile_live_wallet` (`reconcile.rs:24-73`). Si `!had_recent_orders` (`RECENT_ORDER_WINDOW_MS = 120_000`) y `|wallet_usdt - ledger_cash| > 0.001 USDT`, registra depósito/retiro externo neutral al TWR y audita `EXTERNAL_DEPOSIT`/`EXTERNAL_WITHDRAWAL`. Si algún coin base difiere `> base_precision`, escribe `HALT_LOCK`, audita `RECONCILIATION_MISMATCH` y aborta.
-9. **`PRE_TRADE_MTM_AND_DD_GATE` (`:250-264`)**: ejecuta `ledger.mark_to_market(&prices)`. Si drawdown TWR `> 25%`, ejecuta `handle_hard_drawdown_halt` (`:460-503`): `halted = true`, escribe `state/HALT_LOCK`, sella evento `HARD_DRAWDOWN_HALT` y notifica.
-10. **`SIGNAL_AND_PLAN` (`:266-279`)**: `compute_b2_01_signals` + `plan_rebalance_orders` con `allow_buys = !drain_mode && !halt_lock && !ledger.is_halted()`. En `DRAIN_MODE.lock` se bloquean compras pero se permiten ventas de salida.
-11. **`EXECUTE_ORDERS` (`:281-369`)**:
-    - `Paper`: `simulate_paper_orders` (`:729-838`), slippage `2 bps` desfavorable (`+2 bps` Buy / `-2 bps` Sell), comisión `10 bps` con asimetría Spot V5, cero llamadas privadas.
-    - `LiveSpot`: por cada orden, verifica `query_order_by_link_id` antes de emitir `/v5/order/create`, limita el gasto `Buy` al `9970/10000` del efectivo en libro (`:311-322`), aplica `apply_live_fill` y sella `ORDER_FILL` en el ledger.
-12. **`POST_TRADE_MTM_AND_PERSIST` (`:371-413`)**: marca a mercado si hubo fills, exige `ledger.assert_zero_drift(&prices)?` y persiste atómicamente `state/primary_state.json`.
-13. **`SHADOW_4H_GATE` (`:415-422, 505-619`)**: si `is_4h_utc_close(common_last_open_ts)` y `closed_hour_ts_ms > last_processed_4h_close_ts_ms`, agrega `1h -> 4h`, valida `>= 147` velas `4h`, calcula `compute_a0_4h_signals`, simula libro sombra `A0_4H` en `Paper`, verifica `assert_zero_drift`, persiste `state/m2b_shadow_4h_state.json` y registra `SHADOW_4H_CYCLE`.
-14. **`BEST_EFFORT_NOTIFICATIONS` (`:424-448`)**: envía resumen de órdenes y resumen diario UTC vía `NotifierPort` descartando errores de red (`let _ = ...`) para nunca abortar persistencia.
+1. **`ACQUIRE_RUN_LOCK` (`:80`)**: `FsStateStore::acquire_run_lock` crea `state/run.lock` con `OpenOptions::create_new(true)` (`O_CREAT | O_EXCL`, `state_store.rs:95-124`). Si ya existe retorna `InfraError::LockBusy`; el guard RAII `FsRunLockGuard::drop` elimina el archivo al salir de ámbito.
+2. **`LIVE_SAFETY_PREGATE` (`:82-92`)**: si `mode == LiveSpot`, verifica el Double Safety Lock (`BYBIT_SPOT_LIVE_EXECUTION=true` y `BYBIT_SPOT_ACK_LIVE` exacto) y la ausencia de `state/HALT_LOCK` (`AppError::HaltLockActive`). No aborta por `state/DRAIN_MODE.lock`, permitiendo drenaje ordenado mediante ventas de salida.
+3. **`CLOCK_SKEW_GUARD` (`:94-103`)**: consulta `/v5/market/time` y `clock.now_ms()`; si `|local - server| > max_clock_skew_ms` (default `2000 ms`) aborta con `InfraError::ClockSkew`.
+4. **`INGEST_AND_ALIGN` (`:105-128`)**: descarga `instruments-info`, `tickers` (`last > 0`) y `700` velas `1h` por símbolo; filtra estrictamente velas cerradas (`filter_strictly_closed_1h`) y alinea los 5 pares al último timestamp común (`align_candles_to_common_latest`, mínimo `600` velas cerradas `1h`).
+5. **`IDEMPOTENCY_GATE` (`:130-135`)**: si `closed_hour_ts_ms <= prev_state.last_processed_hour_ts_ms`, retorna `CycleOutcome::AlreadyProcessed` sin emitir órdenes, ledger ni alertas.
+6. **`LOAD_OR_BOOTSTRAP_LEDGER` (`:137-158`)**: carga `state/primary_state.json` (validando `assert_book_zero_drift`) o inicializa libro nuevo (`Paper`: `paper_initial_cash_1e8`; `LiveSpot`: `init_live_ledger_from_wallet` desde `UNIFIED` wallet).
+7. **`LOCKFILE_EVAL` (`:160-161`)**: evalúa `DRAIN_MODE.lock` (`drain_mode`) y `HALT_LOCK` (`halt_lock`).
+8. **`LIVE_WALLET_RECONCILE` (`:163-244`, solo `LiveSpot`)**: llama `reconcile_live_wallet` (`reconcile.rs:24-73`). Si `!had_recent_orders` (`RECENT_ORDER_WINDOW_MS = 120_000`) y `|wallet_usdt - ledger_cash| > 0.001 USDT`, registra depósito/retiro externo neutral al TWR y audita `EXTERNAL_DEPOSIT`/`EXTERNAL_WITHDRAWAL`. Si algún coin base difiere `> base_precision`, escribe `HALT_LOCK`, audita `RECONCILIATION_MISMATCH` y aborta.
+9. **`PRE_TRADE_MTM_AND_DD_GATE` (`:246-260`)**: ejecuta `ledger.mark_to_market(&prices)`. Si drawdown TWR `> 25%`, ejecuta `handle_hard_drawdown_halt` (`:464-507`): `halted = true`, escribe `state/HALT_LOCK`, sella evento `HARD_DRAWDOWN_HALT` y notifica.
+10. **`SIGNAL_AND_PLAN` (`:262-275`)**: `compute_b2_01_signals` + `plan_rebalance_orders` con `allow_buys = !drain_mode && !halt_lock && !ledger.is_halted()`. Tanto en `--paper` como en `--live-spot`, bajo `DRAIN_MODE.lock` se bloquean estrictamente todas las compras (`Buy`) y se permiten ventas de salida/reducción (`Sell`).
+11. **`EXECUTE_ORDERS` (`:277-371`)**:
+    - `Paper`: `simulate_paper_orders` (`:731-842`), slippage `2 bps` desfavorable (`+2 bps` Buy / `-2 bps` Sell), comisión `10 bps` con asimetría Spot V5, cero llamadas privadas.
+    - `LiveSpot`: por cada orden, verifica `query_order_by_link_id` antes de emitir `/v5/order/create`, limita el gasto `Buy` al `9970/10000` del efectivo en libro (`:307-320`), aplica la guarda defensiva `guard_live_order_request` (`:331-336,844-856`) para rechazar cualquier `OrderSide::Buy` si `drain_mode || halt_lock || ledger.is_halted()`, ejecuta `execute_spot_order`, aplica `apply_live_fill` y sella `ORDER_FILL` en el ledger.
+12. **`POST_TRADE_MTM_AND_PERSIST` (`:373-415`)**: marca a mercado si hubo fills, exige `ledger.assert_zero_drift(&prices)?` y persiste atómicamente `state/primary_state.json`.
+13. **`SHADOW_4H_GATE` (`:417-424, 509-623`)**: si `is_4h_utc_close(common_last_open_ts)` y `closed_hour_ts_ms > last_processed_4h_close_ts_ms`, agrega `1h -> 4h`, valida `>= 147` velas `4h`, calcula `compute_a0_4h_signals`, simula libro sombra `A0_4H` en `Paper`, verifica `assert_zero_drift`, persiste `state/m2b_shadow_4h_state.json` y registra `SHADOW_4H_CYCLE`.
+14. **`BEST_EFFORT_NOTIFICATIONS` (`:426-451`)**: envía resumen de órdenes (incluyendo `drain_mode=true/false`) y resumen diario UTC vía `NotifierPort` descartando errores de red (`let _ = ...`) para nunca abortar persistencia.
 
-### 3.4 Double Safety Lock para `--live-spot`
+### 3.4 Double Safety Lock para `--live-spot` y Semántica Unificada de `DRAIN_MODE.lock`
 
-La ejecución real de órdenes Spot en Bybit V5 exige la conjunción simultánea de **5 guardas independientes** (`src/main.rs:31`, `src/infrastructure/config.rs:10,124-132`, `src/application/cycle.rs:81-96`):
+La ejecución real de órdenes Spot en Bybit V5 exige la conjunción simultánea de **4 guardas fail-closed obligatorias** (`src/main.rs:31`, `src/infrastructure/config.rs:10,124-132`, `src/application/cycle.rs:82-92,209-243,464-507`):
 
 1. Bandera explícita de CLI: `vortex-m2b-spot run --live-spot` (`run` sin argumentos o con `--paper` ejecuta `ExecutionMode::Paper`).
 2. Variable de entorno `BYBIT_SPOT_LIVE_EXECUTION=true`.
 3. Confirmación literal exacta `BYBIT_SPOT_ACK_LIVE=YES_I_ACCEPT_0X_SPOT_RISK`.
-4. Ausencia del archivo `state/DRAIN_MODE.lock` (de lo contrario: `AppError::LiveSafetyLockDenied`).
-5. Ausencia del archivo `state/HALT_LOCK` (de lo contrario: `AppError::HaltLockActive`).
+4. Ausencia de `state/HALT_LOCK` (`AppError::HaltLockActive`), junto con parada dura automática ante cualquier `RECONCILIATION_MISMATCH` (`base_discrepancies`) o `HARD_DRAWDOWN_HALT` (`> 25%` TWR).
+
+**Comportamiento unificado de `state/DRAIN_MODE.lock` (`--paper` y `--live-spot`):**
+- La presencia de `state/DRAIN_MODE.lock` **no aborta** el ciclo horario en `--live-spot`; unifica su semántica con `--paper` para permitir un drenaje ordenado de cartera:
+  - **Bloqueo estricto de compras:** `allow_buys` se fuerza a `false` en `plan_rebalance_orders` (`src/application/cycle.rs:264`) y una guarda defensiva adicional (`guard_live_order_request`, `:331-336,844-856`) rechaza cualquier `OrderRequest` con `OrderSide::Buy` justo antes de `SpotExecutionPort::execute_spot_order`.
+  - **Ejecución normal de ventas de salida/reducción:** las órdenes `OrderSide::Sell` generadas por el planificador (reducción de peso o liquidación total por `TSMOM` negativo) se ejecutan normalmente en `--paper` y `--live-spot`, preservando idempotencia `orderLinkId`, conciliación de wallet, `Drift == 0` y trazabilidad explícita `drain_mode=true/false` tanto en `CYCLE_EXECUTED` (`src/main.rs:78-87`) como en las alertas Telegram (`src/application/cycle.rs:426-437`).
 
 ---
 
