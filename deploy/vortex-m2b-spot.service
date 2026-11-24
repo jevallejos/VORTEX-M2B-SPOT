@@ -1,0 +1,23 @@
+[Unit]
+Description=VORTEX-M2B-SPOT 1h Spot 0x TSMOM Vol-Targeted Engine (Paper Mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/vortex-m2b-spot
+EnvironmentFile=-/home/ubuntu/vortex-m2b-spot/.env
+ExecStart=/home/ubuntu/vortex-m2b-spot/bin/vortex-m2b-spot run --paper
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vortex-m2b-spot
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

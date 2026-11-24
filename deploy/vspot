@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+trap 'exit 130' INT
+
+APP_DIR="/home/ubuntu/vortex-m2b-spot"
+BIN_PATH="${APP_DIR}/bin/vortex-m2b-spot"
+LEDGER_PATH="${APP_DIR}/logs/m2b_audit_ledger.jsonl"
+
+usage() {
+    cat <<'EOF'
+Usage: vspot <command>
+
+Read-only operational commands for VORTEX-M2B-SPOT:
+  status   Show primary B2-01 and shadow A0_4H portfolio state and lock flags
+  logs     Show recent systemd journal logs for vortex-m2b-spot.service
+  ledger   Show last 20 sealed entries from logs/m2b_audit_ledger.jsonl
+  health   Run read-only connectivity, clock-skew, and permission checks
+  timer    Show systemd timer and service status
+EOF
+}
+
+cmd="${1:-}"
+if [[ -z "${cmd}" ]]; then
+    usage
+    exit 1
+fi
+
+case "${cmd}" in
+    status)
+        if [[ ! -x "${BIN_PATH}" ]]; then
+            echo "ERROR: binary not found at ${BIN_PATH}" >&2
+            exit 1
+        fi
+        cd "${APP_DIR}"
+        "${BIN_PATH}" status
+        echo "--- Lock Files ---"
+        if [[ -f "${APP_DIR}/state/DRAIN_MODE.lock" ]]; then
+            echo "DRAIN_MODE.lock: PRESENT"
+        else
+            echo "DRAIN_MODE.lock: absent"
+        fi
+        if [[ -f "${APP_DIR}/state/HALT_LOCK" ]]; then
+            echo "HALT_LOCK: PRESENT"
+        else
+            echo "HALT_LOCK: absent"
+        fi
+        ;;
+    logs)
+        journalctl -u vortex-m2b-spot.service -n 100 --no-pager
+        ;;
+    ledger)
+        if [[ ! -f "${LEDGER_PATH}" ]]; then
+            echo "No audit ledger yet at ${LEDGER_PATH}"
+            exit 0
+        fi
+        tail -n 20 "${LEDGER_PATH}"
+        ;;
+    health)
+        if [[ ! -x "${BIN_PATH}" ]]; then
+            echo "ERROR: binary not found at ${BIN_PATH}" >&2
+            exit 1
+        fi
+        cd "${APP_DIR}"
+        "${BIN_PATH}" health
+        ;;
+    timer)
+        systemctl list-timers --all vortex-m2b-spot.timer --no-pager
+        systemctl status vortex-m2b-spot.timer --no-pager || true
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "ERROR: unknown command '${cmd}'" >&2
+        usage >&2
+        exit 1
+        ;;
+esac
