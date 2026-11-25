@@ -24,7 +24,7 @@ Documentación técnica y operacional de **VORTEX-M2B-SPOT** (`v1.0.0`): motor d
 | [`.gitattributes`](../.gitattributes) | Reglas de fin de línea `eol=lf` para código Rust, TOML, Markdown, YAML, scripts shell y `deploy/vspot`. |
 | [`deploy/install_tokio.sh`](../deploy/install_tokio.sh) | Instalador idempotente para `/home/ubuntu/vortex-m2b-spot` (`bin/`, `state/`, `logs/`, `.env` `0600`, `vspot`, unidades `systemd`). |
 | [`deploy/vortex-m2b-spot.service`](../deploy/vortex-m2b-spot.service) | Servicio `systemd` `Type=oneshot` ejecutando `vortex-m2b-spot run --paper`. |
-| [`deploy/vortex-m2b-spot.timer`](../deploy/vortex-m2b-spot.timer) | Temporizador `systemd` horario (`*:00:08 UTC`, `RandomizedDelaySec=4`, `Persistent=true`). |
+| [`deploy/vortex-m2b-spot.timer`](../deploy/vortex-m2b-spot.timer) | Temporizador `systemd` horario (`*:00:15 UTC`, `RandomizedDelaySec=10`, `Persistent=true`). |
 | [`deploy/vspot`](../deploy/vspot) | CLI operacional de solo lectura (`/usr/local/bin/vspot`: `status`, `logs`, `ledger`, `health`, `timer`). |
 
 ---

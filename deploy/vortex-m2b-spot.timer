@@ -3,8 +3,8 @@ Description=VORTEX-M2B-SPOT Hourly Closed-Bar Timer
 Requires=vortex-m2b-spot.service
 
 [Timer]
-OnCalendar=*-*-* *:00:08 UTC
-RandomizedDelaySec=4
+OnCalendar=*-*-* *:00:15 UTC
+RandomizedDelaySec=10
 Persistent=true
 Unit=vortex-m2b-spot.service
 

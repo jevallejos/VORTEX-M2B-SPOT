@@ -95,8 +95,8 @@ Qué realiza exactamente `deploy/install_tokio.sh` (`deploy/install_tokio.sh:1-4
 ## 5. Verificación Post-Instalación de `systemd` y Conectividad
 
 1. **Verificar configuración del timer `systemd`** (`deploy/vortex-m2b-spot.timer:5-9`):
-   - `OnCalendar=*-*-* *:00:08 UTC` (dispara 8 segundos después de cada cierre horario UTC)
-   - `RandomizedDelaySec=4` (jitter controlado entre `:00:08` y `:00:12` UTC)
+   - `OnCalendar=*-*-* *:00:15 UTC` (dispara 15 segundos después de cada cierre horario UTC, evitando congestión global de `:00:00..:00:10 UTC`)
+   - `RandomizedDelaySec=10` (jitter controlado entre `:00:15` y `:00:25` UTC)
    - `Persistent=true` (recupera disparo pendiente si el host estuvo apagado)
    - `Unit=vortex-m2b-spot.service`
 
@@ -115,7 +115,7 @@ Qué realiza exactamente `deploy/install_tokio.sh` (`deploy/install_tokio.sh:1-4
    vspot status
    ```
    - `vspot health` debe imprimir `=== VORTEX-M2B-SPOT HEALTH OK ===`, `Clock Skew (ms) : <N> (limit 2000)`, `State Dir : state (rw)`, `Logs Dir : logs (rw)` y las 5 reglas Spot (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `LINKUSDT`, `AVAXUSDT`) con `status=Trading`.
-   - `vspot timer` debe mostrar `vortex-m2b-spot.timer` en estado `active (waiting)` con el próximo disparo al minuto `:00:08 UTC`.
+   - `vspot timer` debe mostrar `vortex-m2b-spot.timer` en estado `active (waiting)` con el próximo disparo al minuto `:00:15 UTC` (ventana efectiva `:00:15..:00:25 UTC`).
 
 4. **Ejecución manual inicial (opcional para validar primer ciclo `--paper`)**:
    ```bash
@@ -125,6 +125,11 @@ Qué realiza exactamente `deploy/install_tokio.sh` (`deploy/install_tokio.sh:1-4
    vspot ledger
    ```
    Confirmar `drift_1e8=0` tanto en la salida `CYCLE_EXECUTED` como en `vspot status` para `B2-01` y (al cruzar un cierre `4h` UTC `00/04/08/12/16/20 UTC`) para `A0_4H`.
+
+5. **Endurecimiento operativo `v1.0.2` (Bybit V5 y ventana de disparo)**:
+   - **Parseo en 2 etapas (`src/infrastructure/bybit_spot_v5.rs`)**: `parse_bybit_envelope` deserializa primero el sobre intermedio `RawBybitEnvelope` y evalúa `retCode != 0` antes de parsear `result`, devolviendo `InfraError::ExchangeApi` ante errores transitorios con `"result": {}` (evitando falsos `InfraError::Parse("missing field 'list'")`); cuando `retCode == 0` y falla `result`, incluye un prefijo sanitizado/acotado (`<= 160` caracteres) para diagnóstico forense.
+   - **Reintentos acotados con backoff `1s/2s/4s` en lecturas `GET`**: las consultas idempotentes `GET` (`market/time`, `instruments-info`, `kline`, `tickers`, `wallet-balance`, `order/realtime`, `order/history`, `execution/list`) aplican hasta 3 reintentos (4 intentos totales, backoff determinista `1s -> 2s -> 4s`) únicamente para errores transitorios recuperables (transporte/timeout, HTTP `408`/`429`/`5xx`, Bybit `10006`, `10016`, `10018`, `-1`, `10000`). `POST /v5/order/create` nunca se reintenta ciegamente y permanece gobernado por `orderLinkId` y conciliación explícita.
+   - **Ventana de disparo anti-congestión**: `OnCalendar=*-*-* *:00:15 UTC` con `RandomizedDelaySec=10` (disparo efectivo `:00:15..:00:25 UTC`) preserva la vela recién cerrada evitando picos de carga globales de inicio de hora.
 
 ---
 
@@ -217,7 +222,7 @@ sudo systemctl disable vortex-m2b-spot.timer
 
 Antes de considerar la promoción desde `--paper` hacia `--live-spot`, verificar **todos** los siguientes puntos al cumplirse los 30 días (~720 ciclos horarios `1h` y ~180 cierres `4h` UTC):
 
-- [ ] **Continuidad de ciclos (`B2-01`)**: `>= 99%` de las 720 horas UTC ejecutadas puntualmente (`*:00:08..12 UTC`), sin fallos repetidos de reloj (`ClockSkew`) ni `run.lock` colgados.
+- [ ] **Continuidad de ciclos (`B2-01`)**: `>= 99%` de las 720 horas UTC ejecutadas puntualmente (`*:00:15..25 UTC`), sin fallos repetidos de reloj (`ClockSkew`) ni `run.lock` colgados.
 - [ ] **Telemetría paralela (`A0_4H`)**: `180` cierres `4h` UTC (`00/04/08/12/16/20 UTC`) registrados en `state/m2b_shadow_4h_state.json` y `logs/m2b_audit_ledger.jsonl` con `SHADOW_4H_CYCLE`.
 - [ ] **Invariante contable**: `100%` de las líneas en `logs/m2b_audit_ledger.jsonl` con `"drift_1e8":0` y sello `fnv1a64_hex` válido (cero manipulaciones o truncamientos).
 - [ ] **Sin `HALT_LOCK` no resueltos**: Ningún evento inesperado de `HARD_DRAWDOWN_HALT`; cualquier drawdown registrado dentro de límites de riesgo esperados (`<= 25%` TWR).
