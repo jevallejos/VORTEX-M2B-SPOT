@@ -9,8 +9,8 @@ use sha2::Sha256;
 use crate::domain::error::InfraError;
 use crate::domain::ports::{ClockPort, MarketDataPort, SpotExecutionPort};
 use crate::domain::types::{
-    parse_decimal_1e8, Candle, FillReport, InstrumentRules, Money1e8, OrderRequest, OrderSide,
-    Price1e8, Qty1e8, Symbol, TickerSnapshot, WalletSnapshot, UNIVERSE_LEN,
+    parse_decimal_1e8, AssetSymbol, Candle, FillReport, InstrumentRules, Money1e8, OrderRequest,
+    OrderSide, Price1e8, Qty1e8, TickerSnapshot, Universe, WalletSnapshot,
 };
 use crate::infrastructure::config::AppConfig;
 
@@ -37,7 +37,7 @@ impl ClockPort for SystemClock {
 pub struct PaperNoopExecutionPort;
 
 impl SpotExecutionPort for PaperNoopExecutionPort {
-    fn fetch_wallet_snapshot(&self) -> Result<WalletSnapshot, InfraError> {
+    fn fetch_wallet_snapshot(&self, _universe: &Universe) -> Result<WalletSnapshot, InfraError> {
         Err(InfraError::Config(
             "PaperNoopExecutionPort::fetch_wallet_snapshot called in paper mode".to_string(),
         ))
@@ -45,7 +45,7 @@ impl SpotExecutionPort for PaperNoopExecutionPort {
 
     fn query_order_by_link_id(
         &self,
-        _symbol: Symbol,
+        _symbol: &AssetSymbol,
         _order_link_id: &str,
     ) -> Result<Option<FillReport>, InfraError> {
         Err(InfraError::Config(
@@ -79,6 +79,65 @@ pub fn sign_bybit_v5(
     mac.update(sign_input.as_bytes());
     let bytes = mac.finalize().into_bytes();
     Ok(hex::encode(bytes))
+}
+
+pub fn parse_wallet_balance_for_universe(
+    raw: &str,
+    universe: &Universe,
+    fetched_at_ms: i64,
+) -> Result<WalletSnapshot, InfraError> {
+    let env: BybitEnvelope<WalletBalanceResult> = parse_bybit_envelope(raw)?;
+    build_wallet_snapshot_from_result(env.result, universe, fetched_at_ms)
+}
+
+fn build_wallet_snapshot_from_result(
+    result: WalletBalanceResult,
+    universe: &Universe,
+    fetched_at_ms: i64,
+) -> Result<WalletSnapshot, InfraError> {
+    let account = result.list.into_iter().next().ok_or_else(|| {
+        InfraError::Parse("missing UNIFIED account entry in wallet-balance".to_string())
+    })?;
+
+    let mut usdt_free_1e8 = Money1e8::ZERO;
+    let mut usdt_locked_1e8 = Money1e8::ZERO;
+    let mut coin_free_1e8 = vec![Qty1e8::ZERO; universe.len()];
+    let mut coin_locked_1e8 = vec![Qty1e8::ZERO; universe.len()];
+
+    for c in account.coin {
+        let total_raw = parse_opt_decimal_1e8(c.wallet_balance.as_deref())?;
+        let locked_raw = parse_opt_decimal_1e8(c.locked.as_deref())?;
+        let free_raw = total_raw.checked_sub(locked_raw).ok_or_else(|| {
+            InfraError::Parse(format!("wallet arithmetic underflow for coin {}", c.coin))
+        })?;
+        if free_raw < 0 || locked_raw < 0 {
+            return Err(InfraError::Parse(format!(
+                "negative wallet balance for coin {}: total={total_raw}, locked={locked_raw}",
+                c.coin
+            )));
+        }
+
+        if c.coin == "USDT" {
+            usdt_free_1e8 = Money1e8(free_raw);
+            usdt_locked_1e8 = Money1e8(locked_raw);
+        } else {
+            for (id, sym) in universe.iter_with_ids() {
+                if c.coin == sym.base_coin() {
+                    let idx = id.index();
+                    coin_free_1e8[idx] = Qty1e8(free_raw);
+                    coin_locked_1e8[idx] = Qty1e8(locked_raw);
+                }
+            }
+        }
+    }
+
+    Ok(WalletSnapshot {
+        usdt_free_1e8,
+        usdt_locked_1e8,
+        coin_free_1e8,
+        coin_locked_1e8,
+        fetched_at_ms,
+    })
 }
 
 #[derive(Clone)]
@@ -259,7 +318,7 @@ impl BybitSpotV5Client {
 
     fn query_order_status_internal(
         &self,
-        symbol: Symbol,
+        symbol: &AssetSymbol,
         order_link_id: &str,
     ) -> Result<OrderLookupOutcome, InfraError> {
         let query = format!(
@@ -336,7 +395,7 @@ impl BybitSpotV5Client {
         };
 
         Ok(OrderLookupOutcome::Filled(FillReport {
-            symbol,
+            symbol: symbol.clone(),
             side,
             order_id: ord.order_id,
             order_link_id: ord.order_link_id,
@@ -351,7 +410,7 @@ impl BybitSpotV5Client {
 
     fn fetch_order_execution_fee(
         &self,
-        symbol: Symbol,
+        symbol: &AssetSymbol,
         side: OrderSide,
         order_id: &str,
         fallback_cum_fee: Option<&str>,
@@ -435,10 +494,10 @@ impl MarketDataPort for BybitSpotV5Client {
 
     fn fetch_instruments_info(
         &self,
-        symbols: &[Symbol; UNIVERSE_LEN],
-    ) -> Result<[InstrumentRules; UNIVERSE_LEN], InfraError> {
-        let mut out: Vec<InstrumentRules> = Vec::with_capacity(UNIVERSE_LEN);
-        for &sym in symbols {
+        symbols: &[AssetSymbol],
+    ) -> Result<Vec<InstrumentRules>, InfraError> {
+        let mut out: Vec<InstrumentRules> = Vec::with_capacity(symbols.len());
+        for sym in symbols {
             let path = format!(
                 "/v5/market/instruments-info?category=spot&symbol={}",
                 sym.as_str()
@@ -476,7 +535,7 @@ impl MarketDataPort for BybitSpotV5Client {
             }
 
             out.push(InstrumentRules {
-                symbol: sym,
+                symbol: sym.clone(),
                 base_precision,
                 quote_precision,
                 min_order_qty,
@@ -486,11 +545,14 @@ impl MarketDataPort for BybitSpotV5Client {
             });
         }
 
-        out.try_into()
-            .map_err(|_| InfraError::Parse("unexpected instrument rules count".to_string()))
+        Ok(out)
     }
 
-    fn fetch_klines_1h(&self, symbol: Symbol, limit: usize) -> Result<Vec<Candle>, InfraError> {
+    fn fetch_klines_1h(
+        &self,
+        symbol: &AssetSymbol,
+        limit: usize,
+    ) -> Result<Vec<Candle>, InfraError> {
         let capped_limit = limit.clamp(1, 1000);
         let path = format!(
             "/v5/market/kline?category=spot&symbol={}&interval=60&limit={}",
@@ -538,12 +600,9 @@ impl MarketDataPort for BybitSpotV5Client {
         Ok(candles)
     }
 
-    fn fetch_tickers(
-        &self,
-        symbols: &[Symbol; UNIVERSE_LEN],
-    ) -> Result<[TickerSnapshot; UNIVERSE_LEN], InfraError> {
-        let mut out: Vec<TickerSnapshot> = Vec::with_capacity(UNIVERSE_LEN);
-        for &sym in symbols {
+    fn fetch_tickers(&self, symbols: &[AssetSymbol]) -> Result<Vec<TickerSnapshot>, InfraError> {
+        let mut out: Vec<TickerSnapshot> = Vec::with_capacity(symbols.len());
+        for sym in symbols {
             let path = format!("/v5/market/tickers?category=spot&symbol={}", sym.as_str());
             let env: BybitEnvelope<TickersResult> = self.get_public_envelope(&path)?;
             let item = env
@@ -578,71 +637,27 @@ impl MarketDataPort for BybitSpotV5Client {
             }
 
             out.push(TickerSnapshot {
-                symbol: sym,
+                symbol: sym.clone(),
                 bid1,
                 ask1,
                 last,
             });
         }
 
-        out.try_into()
-            .map_err(|_| InfraError::Parse("unexpected ticker count".to_string()))
+        Ok(out)
     }
 }
 
 impl SpotExecutionPort for BybitSpotV5Client {
-    fn fetch_wallet_snapshot(&self) -> Result<WalletSnapshot, InfraError> {
+    fn fetch_wallet_snapshot(&self, universe: &Universe) -> Result<WalletSnapshot, InfraError> {
         let env: BybitEnvelope<WalletBalanceResult> =
             self.get_private_envelope("/v5/account/wallet-balance", "accountType=UNIFIED")?;
-
-        let account = env.result.list.into_iter().next().ok_or_else(|| {
-            InfraError::Parse("missing UNIFIED account entry in wallet-balance".to_string())
-        })?;
-
-        let mut usdt_free_1e8 = Money1e8::ZERO;
-        let mut usdt_locked_1e8 = Money1e8::ZERO;
-        let mut coin_free_1e8 = [Qty1e8::ZERO; UNIVERSE_LEN];
-        let mut coin_locked_1e8 = [Qty1e8::ZERO; UNIVERSE_LEN];
-
-        for c in account.coin {
-            let total_raw = parse_opt_decimal_1e8(c.wallet_balance.as_deref())?;
-            let locked_raw = parse_opt_decimal_1e8(c.locked.as_deref())?;
-            let free_raw = total_raw.checked_sub(locked_raw).ok_or_else(|| {
-                InfraError::Parse(format!("wallet arithmetic underflow for coin {}", c.coin))
-            })?;
-            if free_raw < 0 || locked_raw < 0 {
-                return Err(InfraError::Parse(format!(
-                    "negative wallet balance for coin {}: total={total_raw}, locked={locked_raw}",
-                    c.coin
-                )));
-            }
-
-            if c.coin == "USDT" {
-                usdt_free_1e8 = Money1e8(free_raw);
-                usdt_locked_1e8 = Money1e8(locked_raw);
-            } else {
-                for sym in Symbol::ALL {
-                    if c.coin == sym.base_coin() {
-                        let idx = sym.index();
-                        coin_free_1e8[idx] = Qty1e8(free_raw);
-                        coin_locked_1e8[idx] = Qty1e8(locked_raw);
-                    }
-                }
-            }
-        }
-
-        Ok(WalletSnapshot {
-            usdt_free_1e8,
-            usdt_locked_1e8,
-            coin_free_1e8,
-            coin_locked_1e8,
-            fetched_at_ms: self.clock.now_ms(),
-        })
+        build_wallet_snapshot_from_result(env.result, universe, self.clock.now_ms())
     }
 
     fn query_order_by_link_id(
         &self,
-        symbol: Symbol,
+        symbol: &AssetSymbol,
         order_link_id: &str,
     ) -> Result<Option<FillReport>, InfraError> {
         for attempt in 1..=3 {
@@ -726,7 +741,7 @@ impl SpotExecutionPort for BybitSpotV5Client {
             Err((uncertain_network_or_5xx, orig_err)) => {
                 if uncertain_network_or_5xx {
                     if let Ok(Some(fill)) =
-                        self.query_order_by_link_id(req.symbol, &req.order_link_id)
+                        self.query_order_by_link_id(&req.symbol, &req.order_link_id)
                     {
                         return Ok(fill);
                     }
@@ -736,7 +751,7 @@ impl SpotExecutionPort for BybitSpotV5Client {
         }
 
         for attempt in 1..=MAX_FILL_POLL_ATTEMPTS {
-            match self.query_order_status_internal(req.symbol, &req.order_link_id)? {
+            match self.query_order_status_internal(&req.symbol, &req.order_link_id)? {
                 OrderLookupOutcome::Filled(fill) => return Ok(fill),
                 OrderLookupOutcome::TerminalEmpty(status) => {
                     return Err(InfraError::ExchangeApi {
@@ -796,7 +811,10 @@ pub fn is_retryable_infra_error(err: &InfraError) -> bool {
         | InfraError::LockBusy(_)
         | InfraError::Config(_)
         | InfraError::Notifier(_)
-        | InfraError::ClockSkew { .. } => false,
+        | InfraError::ClockSkew { .. }
+        | InfraError::SchemaVersionMismatch { .. }
+        | InfraError::UniverseMismatch { .. }
+        | InfraError::CorruptStateLength { .. } => false,
     }
 }
 
@@ -1147,10 +1165,30 @@ mod tests {
     }
 
     #[test]
-    fn test_paper_noop_execution_port_errors() {
+    fn test_paper_noop_execution_port_errors() -> Result<(), InfraError> {
         let noop = PaperNoopExecutionPort;
-        assert!(noop.fetch_wallet_snapshot().is_err());
-        assert!(noop.query_order_by_link_id(Symbol::BtcUsdt, "x").is_err());
+        let universe =
+            Universe::default_universe().map_err(|e| InfraError::Config(e.to_string()))?;
+        let btc = AssetSymbol::new("BTCUSDT").map_err(|e| InfraError::Config(e.to_string()))?;
+        assert!(noop.fetch_wallet_snapshot(&universe).is_err());
+        assert!(noop.query_order_by_link_id(&btc, "x").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_wallet_balance_extracts_xaut_for_default_universe() -> Result<(), InfraError> {
+        let universe =
+            Universe::default_universe().map_err(|e| InfraError::Config(e.to_string()))?;
+        let raw = r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","coin":[{"coin":"USDT","walletBalance":"850.25","locked":"10.00"},{"coin":"BTC","walletBalance":"0.01","locked":"0"},{"coin":"XAUT","walletBalance":"0.125","locked":"0.025"},{"coin":"DOGE","walletBalance":"100","locked":"0"}]}]},"time":1795618808000}"#;
+        let snap = parse_wallet_balance_for_universe(raw, &universe, 1_795_618_808_000)?;
+        assert_eq!(snap.usdt_free_1e8, Money1e8(84_025_000_000));
+        assert_eq!(snap.usdt_locked_1e8, Money1e8(1_000_000_000));
+        assert_eq!(snap.coin_free_1e8.len(), 6);
+        assert_eq!(snap.coin_locked_1e8.len(), 6);
+        assert_eq!(snap.coin_free_1e8[0], Qty1e8(1_000_000)); // 0.01 BTC
+        assert_eq!(snap.coin_free_1e8[5], Qty1e8(10_000_000)); // 0.100 XAUT free
+        assert_eq!(snap.coin_locked_1e8[5], Qty1e8(2_500_000)); // 0.025 XAUT locked
+        Ok(())
     }
 
     #[test]
@@ -1246,10 +1284,22 @@ mod tests {
 
         for non_retryable in [
             InfraError::Parse("missing field `list`".to_string()),
-            InfraError::Http("GET https://api.bybit.com/v5/market/kline returned HTTP 400: invalid param 503 transport".to_string()),
-            InfraError::Http("GET https://api.bybit.com/v5/market/kline returned HTTP 401: unauthorized".to_string()),
-            InfraError::Http("GET https://api.bybit.com/v5/market/kline returned HTTP 403: forbidden".to_string()),
-            InfraError::Http("GET https://api.bybit.com/v5/market/kline returned HTTP 404: not found".to_string()),
+            InfraError::Http(
+                "GET https://api.bybit.com/v5/market/kline returned HTTP 400: invalid param 503 transport"
+                    .to_string(),
+            ),
+            InfraError::Http(
+                "GET https://api.bybit.com/v5/market/kline returned HTTP 401: unauthorized"
+                    .to_string(),
+            ),
+            InfraError::Http(
+                "GET https://api.bybit.com/v5/market/kline returned HTTP 403: forbidden"
+                    .to_string(),
+            ),
+            InfraError::Http(
+                "GET https://api.bybit.com/v5/market/kline returned HTTP 404: not found"
+                    .to_string(),
+            ),
             InfraError::Config("missing key".to_string()),
             InfraError::ClockSkew {
                 skew_ms: 3000,

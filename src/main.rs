@@ -7,7 +7,7 @@ use vortex_m2b_spot::application::cycle::{CycleConfig, CycleOutcome, RunHourlyCy
 use vortex_m2b_spot::domain::accounting::SpotPortfolioLedger;
 use vortex_m2b_spot::domain::error::AppError;
 use vortex_m2b_spot::domain::ports::{ClockPort, MarketDataPort, StateStorePort};
-use vortex_m2b_spot::domain::types::{ExecutionMode, Symbol, RATE_SCALE_1E10, UNIVERSE_LEN};
+use vortex_m2b_spot::domain::types::{ExecutionMode, RATE_SCALE_1E10};
 use vortex_m2b_spot::infrastructure::bybit_spot_v5::{
     BybitSpotV5Client, PaperNoopExecutionPort, SystemClock,
 };
@@ -50,6 +50,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 
     let use_case = RunHourlyCycleUseCase::new(&clock, &market, exec_port, &store, &notifier);
     let cycle_cfg = CycleConfig {
+        universe: cfg.universe.clone(),
         mode,
         paper_initial_cash_1e8: cfg.paper_initial_cash_1e8,
         live_execution_env_flag: cfg.live_execution_env_flag,
@@ -109,19 +110,27 @@ fn cmd_status() -> Result<(), String> {
     println!("=== VORTEX-M2B-SPOT STATUS ===");
     println!("State dir        : {}", store.state_dir().display());
     println!("Logs dir         : {}", store.logs_dir().display());
+    println!(
+        "Universe ({})     : {}",
+        cfg.universe.len(),
+        cfg.universe.as_csv()
+    );
     println!("DRAIN_MODE.lock  : {}", drain_active);
     println!("HALT_LOCK        : {}", halt_active);
 
     match store
-        .load_primary_state()
+        .load_primary_state(&cfg.universe)
         .map_err(|e| format!("failed to load primary state: {e}"))?
     {
         None => {
             println!("Primary B2-01    : not initialized yet (no primary_state.json)");
         }
         Some(st) => {
-            let ledger = SpotPortfolioLedger::from_snapshot(st.portfolio.clone())
-                .map_err(|e| format!("invalid primary portfolio snapshot: {e}"))?;
+            st.validate_against(&cfg.universe)
+                .map_err(|e| format!("primary state invalid for configured universe: {e}"))?;
+            let ledger =
+                SpotPortfolioLedger::from_snapshot(st.portfolio.clone(), cfg.universe.len())
+                    .map_err(|e| format!("invalid primary portfolio snapshot: {e}"))?;
             let equity = ledger
                 .equity_1e8(&st.last_prices_1e8)
                 .map_err(|e| format!("equity calculation error: {e}"))?;
@@ -135,6 +144,7 @@ fn cmd_status() -> Result<(), String> {
 
             println!();
             println!("--- Primary B2-01 (1h) ---");
+            println!("Schema Version   : {}", st.schema_version);
             println!("Mode             : {}", st.mode);
             println!("Last Hour TS (ms): {}", st.last_processed_hour_ts_ms);
             println!("Cash (USDT)      : {}", ledger.cash_1e8().format_fixed(4));
@@ -151,9 +161,11 @@ fn cmd_status() -> Result<(), String> {
                 "{:<10} {:>14} {:>12} {:>10} {:>10} {:>10} {:>10}",
                 "SYMBOL", "QTY", "PRICE", "CUR_W", "TGT_W", "SIGMA_ANN", "TSMOM"
             );
-            for i in 0..UNIVERSE_LEN {
-                let sym = Symbol::ALL[i];
-                let pos = ledger.position(sym);
+            for (id, sym) in cfg.universe.iter_with_ids() {
+                let i = id.index();
+                let pos = ledger
+                    .position(id)
+                    .map_err(|e| format!("position lookup error: {e}"))?;
                 println!(
                     "{:<10} {:>14} {:>12} {:>9.2}% {:>9.2}% {:>9.2}% {:>10.4}",
                     sym.as_str(),
@@ -169,7 +181,7 @@ fn cmd_status() -> Result<(), String> {
     }
 
     match store
-        .load_shadow_4h_state()
+        .load_shadow_4h_state(&cfg.universe)
         .map_err(|e| format!("failed to load shadow 4h state: {e}"))?
     {
         None => {
@@ -177,8 +189,11 @@ fn cmd_status() -> Result<(), String> {
             println!("Shadow A0_4H     : not initialized yet (no m2b_shadow_4h_state.json)");
         }
         Some(sh) => {
-            let ledger = SpotPortfolioLedger::from_snapshot(sh.portfolio.clone())
-                .map_err(|e| format!("invalid shadow portfolio snapshot: {e}"))?;
+            sh.validate_against(&cfg.universe)
+                .map_err(|e| format!("shadow 4h state invalid for configured universe: {e}"))?;
+            let ledger =
+                SpotPortfolioLedger::from_snapshot(sh.portfolio.clone(), cfg.universe.len())
+                    .map_err(|e| format!("invalid shadow portfolio snapshot: {e}"))?;
             let equity = ledger
                 .equity_1e8(&sh.last_prices_1e8)
                 .map_err(|e| format!("shadow equity calculation error: {e}"))?;
@@ -192,10 +207,32 @@ fn cmd_status() -> Result<(), String> {
 
             println!();
             println!("--- Shadow A0_4H (4h UTC Paper) ---");
+            println!("Schema Version   : {}", sh.schema_version);
             println!("Last 4h Close TS : {}", sh.last_processed_4h_close_ts_ms);
             println!("Equity (USDT)    : {}", equity.format_fixed(4));
             println!("TWR Drawdown     : {:.4}%", dd_pct);
             println!("Drift (1e8)      : {}", drift);
+            println!();
+            println!(
+                "{:<10} {:>14} {:>12} {:>10} {:>10} {:>10} {:>10}",
+                "SYMBOL", "QTY", "PRICE", "CUR_W", "TGT_W", "SIGMA_ANN", "TSMOM"
+            );
+            for (id, sym) in cfg.universe.iter_with_ids() {
+                let i = id.index();
+                let pos = ledger
+                    .position(id)
+                    .map_err(|e| format!("shadow position lookup error: {e}"))?;
+                println!(
+                    "{:<10} {:>14} {:>12} {:>9.2}% {:>9.2}% {:>9.2}% {:>10.4}",
+                    sym.as_str(),
+                    pos.qty_1e8.format_fixed(6),
+                    sh.last_prices_1e8[i].format_fixed(4),
+                    sh.last_current_weights[i] * 100.0,
+                    sh.last_target_weights[i] * 100.0,
+                    sh.last_sigma_ann[i] * 100.0,
+                    sh.last_tsmom[i]
+                );
+            }
         }
     }
 
@@ -239,8 +276,15 @@ fn cmd_health() -> Result<(), String> {
     }
 
     let rules = client
-        .fetch_instruments_info(&Symbol::ALL)
+        .fetch_instruments_info(cfg.universe.symbols())
         .map_err(|e| format!("instruments-info check failed: {e}"))?;
+    if rules.len() != cfg.universe.len() {
+        return Err(format!(
+            "instruments-info count mismatch: expected {}, got {}",
+            cfg.universe.len(),
+            rules.len()
+        ));
+    }
 
     println!("=== VORTEX-M2B-SPOT HEALTH OK ===");
     println!("Bybit Base URL   : {}", cfg.bybit_base_url);
@@ -251,12 +295,17 @@ fn cmd_health() -> Result<(), String> {
     );
     println!("State Dir        : {} (rw)", cfg.state_dir.display());
     println!("Logs Dir         : {} (rw)", cfg.logs_dir.display());
+    println!(
+        "Universe ({})     : {}",
+        cfg.universe.len(),
+        cfg.universe.as_csv()
+    );
     for r in rules {
         if !r.is_trading {
             return Err(format!("instrument {} is not in Trading status", r.symbol));
         }
         println!(
-            "Instrument {:<8} | status=Trading | base_step={} | min_qty={} | min_amt={}",
+            "Instrument {:<10} | status=Trading | base_step={} | min_qty={} | min_amt={}",
             r.symbol.as_str(),
             r.base_precision.format_by_step(r.base_precision),
             r.min_order_qty.format_by_step(r.base_precision),

@@ -3,6 +3,20 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
     UnknownSymbol(String),
+    InvalidUniverse(String),
+    UniverseMismatch {
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+    SchemaVersionMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    CorruptStateLength {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     InvalidDecimal(String),
     ArithmeticOverflow,
     DivisionByZero,
@@ -32,6 +46,25 @@ impl fmt::Display for DomainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownSymbol(s) => write!(f, "unknown symbol: {s}"),
+            Self::InvalidUniverse(msg) => write!(f, "invalid universe configuration: {msg}"),
+            Self::UniverseMismatch { expected, actual } => write!(
+                f,
+                "universe mismatch: expected [{}], actual [{}]",
+                expected.join(","),
+                actual.join(",")
+            ),
+            Self::SchemaVersionMismatch { expected, actual } => write!(
+                f,
+                "state schema version mismatch: expected v{expected}, found v{actual} (silent migration is forbidden; back up or archive incompatible state files)"
+            ),
+            Self::CorruptStateLength {
+                field,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "corrupt state length for '{field}': expected {expected}, actual {actual}"
+            ),
             Self::InvalidDecimal(s) => write!(f, "invalid decimal string: {s}"),
             Self::ArithmeticOverflow => write!(f, "checked i128 arithmetic overflow"),
             Self::DivisionByZero => write!(f, "division by zero"),
@@ -76,13 +109,35 @@ impl std::error::Error for DomainError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InfraError {
     Http(String),
-    ExchangeApi { code: i64, msg: String },
+    ExchangeApi {
+        code: i64,
+        msg: String,
+    },
     Parse(String),
     Io(String),
     LockBusy(String),
     Config(String),
     Notifier(String),
-    ClockSkew { skew_ms: i64, max_allowed_ms: i64 },
+    ClockSkew {
+        skew_ms: i64,
+        max_allowed_ms: i64,
+    },
+    SchemaVersionMismatch {
+        expected: u32,
+        actual: u32,
+        path: String,
+    },
+    UniverseMismatch {
+        expected: Vec<String>,
+        actual: Vec<String>,
+        path: String,
+    },
+    CorruptStateLength {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+        path: String,
+    },
 }
 
 impl fmt::Display for InfraError {
@@ -104,6 +159,33 @@ impl fmt::Display for InfraError {
                     "clock skew {skew_ms}ms exceeds max allowed {max_allowed_ms}ms"
                 )
             }
+            Self::SchemaVersionMismatch {
+                expected,
+                actual,
+                path,
+            } => write!(
+                f,
+                "state schema version mismatch in {path}: expected v{expected}, found v{actual} (silent migration is forbidden; back up v{actual} state files before running v1.1.0)"
+            ),
+            Self::UniverseMismatch {
+                expected,
+                actual,
+                path,
+            } => write!(
+                f,
+                "universe mismatch in {path}: expected [{}], actual [{}] (configured M2B_UNIVERSE_SYMBOLS differs from persisted state)",
+                expected.join(","),
+                actual.join(",")
+            ),
+            Self::CorruptStateLength {
+                field,
+                expected,
+                actual,
+                path,
+            } => write!(
+                f,
+                "corrupt state length in {path} for '{field}': expected {expected}, actual {actual}"
+            ),
         }
     }
 }

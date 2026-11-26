@@ -1,7 +1,8 @@
 # VORTEX-M2B-SPOT — Runbook Operacional (`--paper`, Tokio VPS)
 
-**Versión del motor:** `1.0.0` (`vortex-m2b-spot`)  
+**Versión del motor:** `1.1.0` (`vortex-m2b-spot`, `schema_version = 2`)  
 **Modo cubierto:** Validación `--paper` de 30 días (cero llamadas privadas de órdenes a Bybit)  
+**Universo por defecto (`6` pares):** `BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT`  
 **Directorio objetivo en Tokio:** `/home/ubuntu/vortex-m2b-spot`  
 **Repositorio fuente:** `https://github.com/jevallejos/VORTEX-M2B-SPOT.git`
 
@@ -10,8 +11,8 @@
 ## 1. Regla de Aislamiento Estricto (Tokio)
 
 > **CRÍTICO:** Este despliegue es **100% independiente** de cualquier otro servicio en el host Tokio.
-> - **PROHIBIDO** leer, modificar, reiniciar o referenciar `/home/ubuntu/vortex-rs` o sus unidades `systemd`.
-> - Toda instalación, configuración, estado y bitácora de `VORTEX-M2B-SPOT` reside exclusivamente en `/home/ubuntu/vortex-m2b-spot` (código fuente clonado p.ej. en `/home/ubuntu/src/VORTEX-M2B-SPOT` o `/home/ubuntu/VORTEX-M2B-SPOT` y runtime instalado en `/home/ubuntu/vortex-m2b-spot`).
+> - **PROHIBIDO** leer, modificar, reiniciar o referenciar otros repositorios o unidades `systemd` ajenas a `vortex-m2b-spot`.
+> - Toda instalación, configuración, estado y bitácora de `VORTEX-M2B-SPOT` reside exclusivamente en `/home/ubuntu/vortex-m2b-spot` (código fuente clonado p.ej. en `/home/ubuntu/VORTEX-M2B-SPOT` y runtime instalado en `/home/ubuntu/vortex-m2b-spot`).
 
 ---
 
@@ -33,9 +34,9 @@ Verificar antes de instalar:
 
 ---
 
-## 3. Clonado e Inicialización de `.env` (`chmod 600`)
+## 3. Clonado, Configuración de `.env` (`chmod 600`) y Universo (`M2B_UNIVERSE_SYMBOLS`)
 
-1. Clonar el repositorio fuente en un directorio de trabajo limpio (sin tocar `/home/ubuntu/vortex-rs`):
+1. Clonar el repositorio fuente en un directorio de trabajo limpio:
    ```bash
    cd /home/ubuntu
    git clone https://github.com/jevallejos/VORTEX-M2B-SPOT.git VORTEX-M2B-SPOT
@@ -62,7 +63,11 @@ Verificar antes de instalar:
    VORTEX_STATE_DIR=state
    VORTEX_LOGS_DIR=logs
    MAX_CLOCK_SKEW_MS=2000
+   M2B_UNIVERSE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT
    ```
+   - **`M2B_UNIVERSE_SYMBOLS` (opcional, Fail-Closed):**
+     - Si se omite o queda vacía, `v1.1.0` utiliza exactamente `BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT` (`6` pares).
+     - Si se define, debe listar entre `1` y `20` pares Spot `*USDT` únicos, ASCII alfanuméricos de longitud `6..=20` (se recortan espacios y se normalizan a mayúsculas). Cualquier duplicado, entrada vacía o par no-`USDT` aborta el arranque fail-closed.
    - Para recibir alertas en Telegram durante los 30 días de `--paper`, completar `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`.
    - Mantener `BYBIT_API_KEY=`, `BYBIT_API_SECRET=`, `BYBIT_SPOT_LIVE_EXECUTION=false` y `BYBIT_SPOT_ACK_LIVE=` vacíos/desactivados durante toda la fase `--paper`.
    - Confirmar permisos estrictos del archivo `.env`:
@@ -73,7 +78,33 @@ Verificar antes de instalar:
 
 ---
 
-## 4. Instalación Automatizada (`deploy/install_tokio.sh`)
+## 4. Actualización `v1.0.x -> v1.1.0` y Migración Controlada (`schema_version = 1 -> 2`)
+
+> **REGLA FAIL-CLOSED `schema_version = 2`:** `vortex-m2b-spot` `v1.1.0` **prohíbe** migraciones silenciosas. Si existen `state/primary_state.json` o `state/m2b_shadow_4h_state.json` de `v1.0.x` (`schema_version = 1`) o generados con un orden/conjunto distinto de `M2B_UNIVERSE_SYMBOLS`, el motor abortará explícitamente con `SchemaVersionMismatch` o `UniverseMismatch` sin sobrescribir disco.
+
+Si el host Tokio ya ejecutaba `v1.0.1` / `v1.0.2`, ejecutar este respaldo **antes** de correr `v1.1.0`:
+
+```bash
+# 1. Detener el temporizador y confirmar ausencia de ciclo activo
+sudo systemctl stop vortex-m2b-spot.timer
+ls -la /home/ubuntu/vortex-m2b-spot/state/run.lock 2>/dev/null || echo "OK: no run.lock"
+
+# 2. Respaldar archivos v1.0.x (schema_version = 1) y ledger de auditoría
+BACKUP_DIR="/home/ubuntu/vortex-m2b-spot/backups/v1_$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "${BACKUP_DIR}"
+mv /home/ubuntu/vortex-m2b-spot/state/primary_state.json "${BACKUP_DIR}/" 2>/dev/null || true
+mv /home/ubuntu/vortex-m2b-spot/state/m2b_shadow_4h_state.json "${BACKUP_DIR}/" 2>/dev/null || true
+cp -a /home/ubuntu/vortex-m2b-spot/logs/m2b_audit_ledger.jsonl "${BACKUP_DIR}/" 2>/dev/null || true
+
+# 3. Actualizar código fuente a v1.1.0 y revisar .env
+cd /home/ubuntu/VORTEX-M2B-SPOT
+git pull --ff-only origin main
+grep -E '^M2B_UNIVERSE_SYMBOLS=' /home/ubuntu/vortex-m2b-spot/.env || echo "M2B_UNIVERSE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT" >> /home/ubuntu/vortex-m2b-spot/.env
+```
+
+---
+
+## 5. Instalación Automatizada (`deploy/install_tokio.sh`)
 
 Ejecutar el script de instalación provisto en el repositorio:
 
@@ -82,17 +113,17 @@ cd /home/ubuntu/VORTEX-M2B-SPOT
 bash deploy/install_tokio.sh
 ```
 
-Qué realiza exactamente `deploy/install_tokio.sh` (`deploy/install_tokio.sh:1-46`):
+Qué realiza exactamente `deploy/install_tokio.sh` (`deploy/install_tokio.sh:1-51`):
 1. Crea `/home/ubuntu/vortex-m2b-spot/{bin,state,logs}` (`línea 13`).
-2. Si `/home/ubuntu/vortex-m2b-spot/.env` no existe, copia `.env.example` con `install -m 0600`; si ya existe, lo preserva (`líneas 15-20`).
-3. Compila el binario en perfil `release` con mínima prioridad CPU/IO (`nice -n 19 ionice -c 3 cargo build --release`, `línea 24`).
-4. Instala el binario atómicamente (`vortex-m2b-spot.tmp.$$` -> `mv -f`) en `/home/ubuntu/vortex-m2b-spot/bin/vortex-m2b-spot` (`líneas 33-35`).
-5. Instala el helper de solo lectura `deploy/vspot` en `/usr/local/bin/vspot` con permisos `0755` (`línea 38`).
-6. Instala `deploy/vortex-m2b-spot.service` y `deploy/vortex-m2b-spot.timer` en `/etc/systemd/system/` con permisos `0644`, ejecuta `systemctl daemon-reload` y habilita `systemctl enable --now vortex-m2b-spot.timer` (`líneas 40-44`).
+2. Si `/home/ubuntu/vortex-m2b-spot/.env` no existe, copia `.env.example` con `install -m 0600`; si ya existe, lo preserva (`líneas 15-20`). Advierte si detecta `"schema_version": 1` en `state/primary_state.json` (`líneas 22-25`).
+3. Compila el binario en perfil `release` con mínima prioridad CPU/IO (`nice -n 19 ionice -c 3 cargo build --release`, `línea 29`).
+4. Instala el binario atómicamente (`vortex-m2b-spot.tmp.$$` -> `mv -f`) en `/home/ubuntu/vortex-m2b-spot/bin/vortex-m2b-spot` (`líneas 38-40`).
+5. Instala el helper de solo lectura `deploy/vspot` en `/usr/local/bin/vspot` con permisos `0755` (`línea 43`).
+6. Instala `deploy/vortex-m2b-spot.service` y `deploy/vortex-m2b-spot.timer` en `/etc/systemd/system/` con permisos `0644`, ejecuta `systemctl daemon-reload` y habilita `systemctl enable --now vortex-m2b-spot.timer` (`líneas 45-49`).
 
 ---
 
-## 5. Verificación Post-Instalación de `systemd` y Conectividad
+## 6. Verificación Post-Instalación de `systemd` y Conectividad
 
 1. **Verificar configuración del timer `systemd`** (`deploy/vortex-m2b-spot.timer:5-9`):
    - `OnCalendar=*-*-* *:00:15 UTC` (dispara 15 segundos después de cada cierre horario UTC, evitando congestión global de `:00:00..:00:10 UTC`)
@@ -114,35 +145,35 @@ Qué realiza exactamente `deploy/install_tokio.sh` (`deploy/install_tokio.sh:1-4
    vspot timer
    vspot status
    ```
-   - `vspot health` debe imprimir `=== VORTEX-M2B-SPOT HEALTH OK ===`, `Clock Skew (ms) : <N> (limit 2000)`, `State Dir : state (rw)`, `Logs Dir : logs (rw)` y las 5 reglas Spot (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `LINKUSDT`, `AVAXUSDT`) con `status=Trading`.
+   - `vspot health` debe imprimir `=== VORTEX-M2B-SPOT HEALTH OK ===`, `Clock Skew (ms) : <N> (limit 2000)`, `State Dir : state (rw)`, `Logs Dir : logs (rw)`, `Universe (6) : BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT` y las reglas Spot de los **6 pares** (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `LINKUSDT`, `AVAXUSDT`, `XAUTUSDT`) con `status=Trading`.
    - `vspot timer` debe mostrar `vortex-m2b-spot.timer` en estado `active (waiting)` con el próximo disparo al minuto `:00:15 UTC` (ventana efectiva `:00:15..:00:25 UTC`).
 
-4. **Ejecución manual inicial (opcional para validar primer ciclo `--paper`)**:
+4. **Ejecución manual inicial (opcional para validar primer ciclo `--paper` y `schema_version = 2`)**:
    ```bash
    cd /home/ubuntu/vortex-m2b-spot
    ./bin/vortex-m2b-spot run --paper
    vspot status
    vspot ledger
    ```
-   Confirmar `drift_1e8=0` tanto en la salida `CYCLE_EXECUTED` como en `vspot status` para `B2-01` y (al cruzar un cierre `4h` UTC `00/04/08/12/16/20 UTC`) para `A0_4H`.
+   Confirmar `Schema Version : 2` y `drift_1e8=0` tanto en la salida `CYCLE_EXECUTED` como en `vspot status` para `B2-01` (con los 6 símbolos incluyendo `XAUTUSDT`) y, al cruzar un cierre `4h` UTC (`00/04/08/12/16/20 UTC`), para `A0_4H`.
 
-5. **Endurecimiento operativo `v1.0.2` (Bybit V5 y ventana de disparo)**:
-   - **Parseo en 2 etapas (`src/infrastructure/bybit_spot_v5.rs`)**: `parse_bybit_envelope` deserializa primero el sobre intermedio `RawBybitEnvelope` y evalúa `retCode != 0` antes de parsear `result`, devolviendo `InfraError::ExchangeApi` ante errores transitorios con `"result": {}` (evitando falsos `InfraError::Parse("missing field 'list'")`); cuando `retCode == 0` y falla `result`, incluye un prefijo sanitizado/acotado (`<= 160` caracteres) para diagnóstico forense.
-   - **Reintentos acotados con backoff `1s/2s/4s` en lecturas `GET`**: las consultas idempotentes `GET` (`market/time`, `instruments-info`, `kline`, `tickers`, `wallet-balance`, `order/realtime`, `order/history`, `execution/list`) aplican hasta 3 reintentos (4 intentos totales, backoff determinista `1s -> 2s -> 4s`) únicamente para errores transitorios recuperables (transporte/timeout, HTTP `408`/`429`/`5xx`, Bybit `10006`, `10016`, `10018`, `-1`, `10000`). `POST /v5/order/create` nunca se reintenta ciegamente y permanece gobernado por `orderLinkId` y conciliación explícita.
-   - **Ventana de disparo anti-congestión**: `OnCalendar=*-*-* *:00:15 UTC` con `RandomizedDelaySec=10` (disparo efectivo `:00:15..:00:25 UTC`) preserva la vela recién cerrada evitando picos de carga globales de inicio de hora.
+5. **Endurecimiento operativo conservado (`v1.0.2`, Bybit V5 y ventana de disparo)**:
+   - **Parseo en 2 etapas (`src/infrastructure/bybit_spot_v5.rs`):** `parse_bybit_envelope` evalúa `retCode != 0` antes de parsear `result`, devolviendo `InfraError::ExchangeApi` ante errores transitorios con `"result": {}`.
+   - **Reintentos acotados `1s/2s/4s` en `GET`:** Las consultas idempotentes `GET` reintentan hasta 3 veces con re-firma HMAC fresca ante errores transitorios; `POST /v5/order/create` nunca se reintenta ciegamente.
+   - **Ventana de disparo anti-congestión:** `OnCalendar=*-*-* *:00:15 UTC` con `RandomizedDelaySec=10`.
 
 ---
 
-## 6. Monitoreo Diario y Semanal con `/usr/local/bin/vspot`
+## 7. Monitoreo Diario y Semanal con `/usr/local/bin/vspot`
 
 El script `/usr/local/bin/vspot` (`deploy/vspot:1-79`) provee 5 subcomandos de **solo lectura**:
 
 | Comando | Qué inspecciona | Frecuencia recomendada |
 |---|---|---|
-| `vspot status` | Estado de `Primary B2-01 (1h)`, `Shadow A0_4H (4h UTC Paper)`, pesos `CUR_W`/`TGT_W`, `SIGMA_ANN`, `TSMOM`, `Drift (1e8)`, `TWR Drawdown` y presencia de `DRAIN_MODE.lock` / `HALT_LOCK`. | Diaria |
+| `vspot status` | Universo activo, `Schema Version: 2`, estado de `Primary B2-01 (1h)` y `Shadow A0_4H (4h UTC Paper)` iterando sobre todos los pares configurados, pesos `CUR_W`/`TGT_W`, `SIGMA_ANN`, `TSMOM`, `Drift (1e8)`, `TWR Drawdown` y `DRAIN_MODE.lock` / `HALT_LOCK`. | Diaria |
 | `vspot logs` | Últimas 100 líneas del journal de `systemd` (`journalctl -u vortex-m2b-spot.service -n 100 --no-pager`). | Diaria |
 | `vspot ledger` | Últimas 20 entradas selladas (FNV-1a 64-bit) de `/home/ubuntu/vortex-m2b-spot/logs/m2b_audit_ledger.jsonl`. | Diaria / Semanal |
-| `vspot health` | Conectividad pública a Bybit V5, clock skew (`<= 2000ms`), estado `Trading` de los 5 pares y permisos `rw` de `state/` y `logs/`. | Semanal o tras incidentes |
+| `vspot health` | Conectividad pública a Bybit V5, clock skew (`<= 2000ms`), estado `Trading` de todos los pares configurados (6 por defecto) y permisos `rw` de `state/` y `logs/`. | Semanal o tras incidentes |
 | `vspot timer` | Próxima ejecución y estado de `vortex-m2b-spot.timer` (`systemctl list-timers` + `systemctl status`). | Semanal |
 
 ### Verificación semanal adicional (integridad y espacio en disco)
@@ -160,16 +191,15 @@ journalctl -u vortex-m2b-spot.service --since "24 hours ago" -p err --no-pager
 
 ---
 
-## 7. Procedimientos de Emergencia (`DRAIN_MODE.lock` y `HALT_LOCK`)
+## 8. Procedimientos de Emergencia (`DRAIN_MODE.lock` y `HALT_LOCK`)
 
-### 7.1 `DRAIN_MODE.lock` (Drenaje ordenado unificado: bloquea nuevas compras, permite ventas de salida)
+### 8.1 `DRAIN_MODE.lock` (Drenaje ordenado unificado: bloquea nuevas compras, permite ventas de salida)
 
 - **Efecto unificado en `--paper` y `--live-spot`:**
   - `DRAIN_MODE.lock` **no aborta** el ciclo horario en ningún modo.
-  - `allow_buys` pasa estrictamente a `false` (`src/application/cycle.rs:264`), y en `--live-spot` una guarda defensiva adicional (`guard_live_order_request`, `src/application/cycle.rs:331-336,844-856`) rechaza cualquier orden `Buy` antes de invocar `SpotExecutionPort::execute_spot_order`. El motor **no abre ni amplía posiciones** (`0` órdenes `Buy`).
-  - Las órdenes de salida o reducción (`Sell`) planificadas por caída de señal (`TSMOM` negativo / `LIQUIDATE_TARGET_THRESH`) **sí se ejecutan normalmente** en ambos modos, preservando idempotencia `orderLinkId`, conciliación de wallet en `--live-spot` y `Drift == 0`.
-  - La salida `CYCLE_EXECUTED` (`src/main.rs:78-87`) y las alertas Telegram (`src/application/cycle.rs:426-437`) reportan explícitamente `drain_mode=true/false`.
-  - `HALT_LOCK` (Sección 7.2) y el Double Safety Lock continúan siendo paradas duras fail-closed absolutas.
+  - `allow_buys` pasa estrictamente a `false` (`src/application/cycle.rs:309`), y en `--live-spot` una guarda defensiva adicional (`guard_live_order_request`, `src/application/cycle.rs:379-384,938-949`) rechaza cualquier orden `Buy` antes de invocar `SpotExecutionPort::execute_spot_order`. El motor **no abre ni amplía posiciones** (`0` órdenes `Buy`).
+  - Las órdenes de salida o reducción (`Sell`) planificadas por caída de señal (`TSMOM` negativo / `LIQUIDATE_TARGET_THRESH`) **sí se ejecutan normalmente** en ambos modos, preservando idempotencia `orderLinkId`, conciliación de wallet (incluyendo `XAUT`) y `Drift == 0`.
+  - La salida `CYCLE_EXECUTED` (`src/main.rs:78-89`) y las alertas Telegram (`src/application/cycle.rs:480-489`) reportan explícitamente `drain_mode=true/false`.
 
 **Activar `DRAIN_MODE.lock`:**
 ```bash
@@ -183,13 +213,13 @@ rm -f /home/ubuntu/vortex-m2b-spot/state/DRAIN_MODE.lock
 vspot status
 ```
 
-### 7.2 `HALT_LOCK` (Parada dura por Drawdown TWR `> 25%`, discrepancia de conciliación o intervención manual)
+### 8.2 `HALT_LOCK` (Parada dura por Drawdown TWR `> 25%`, discrepancia de conciliación o intervención manual)
 
 - **Cuándo se activa automáticamente:**
-  1. Drawdown TWR estrictamente superior al `25%` (`dd_1e10 > 2_500_000_000`, `src/domain/accounting.rs:7,565`), escribiendo `state/HALT_LOCK` y evento `HARD_DRAWDOWN_HALT` (`src/application/cycle.rs:464-507`).
-  2. Discrepancia de saldo base `> base_precision` en conciliación `--live-spot` (`src/application/cycle.rs:209-243`), escribiendo `state/HALT_LOCK` y evento `RECONCILIATION_MISMATCH`.
-- **Efecto en `--paper`:** `allow_buys = false`, `ledger.is_halted() = true`; las ventas de liquidación siguen siendo evaluables si la señal cae por debajo del umbral, pero no hay nuevas compras.
-- **Efecto en `--live-spot`:** Rechazo inmediato fail-closed (`AppError::HaltLockActive`, `src/application/cycle.rs:89-91`).
+  1. Drawdown TWR estrictamente superior al `25%` (`dd_1e10 > 2_500_000_000`, `src/domain/accounting.rs:8,609`), escribiendo `state/HALT_LOCK` y evento `HARD_DRAWDOWN_HALT` (`src/application/cycle.rs:516-559`).
+  2. Discrepancia de saldo base `> base_precision` en conciliación `--live-spot` (`src/application/cycle.rs:254-288`), escribiendo `state/HALT_LOCK` y evento `RECONCILIATION_MISMATCH`.
+- **Efecto en `--paper`:** `allow_buys = false`, `ledger.is_halted() = true`; no hay nuevas compras.
+- **Efecto en `--live-spot`:** Rechazo inmediato fail-closed (`AppError::HaltLockActive`, `src/application/cycle.rs:91-93`).
 
 **Activar manualmente `HALT_LOCK`:**
 ```bash
@@ -204,12 +234,12 @@ echo "ts_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) reason=manual_operator_halt" > /home
    vspot ledger
    ```
 2. Corregir la causa raíz (revisar eventos `HARD_DRAWDOWN_HALT` o `RECONCILIATION_MISMATCH` en `logs/m2b_audit_ledger.jsonl`).
-3. Solo tras autorización explícita del operador, remover `HALT_LOCK` (si el campo `portfolio.halted` quedó `true` dentro de `state/primary_state.json`, se debe auditar/reiniciar el libro antes de reanudar compras):
+3. Solo tras autorización explícita del operador, remover `HALT_LOCK` (si `portfolio.halted` quedó `true` dentro de `state/primary_state.json`, auditar/reiniciar el libro antes de reanudar compras):
    ```bash
    rm -f /home/ubuntu/vortex-m2b-spot/state/HALT_LOCK
    ```
 
-### 7.3 Detener temporalmente el timer `systemd`
+### 8.3 Detener temporalmente el timer `systemd`
 
 ```bash
 sudo systemctl stop vortex-m2b-spot.timer
@@ -218,15 +248,15 @@ sudo systemctl disable vortex-m2b-spot.timer
 
 ---
 
-## 8. Checklist de Auditoría de 30 Días (`--paper` -> Pre-requisito `--live-spot`)
+## 9. Checklist de Auditoría de 30 Días (`--paper` -> Pre-requisito `--live-spot`)
 
 Antes de considerar la promoción desde `--paper` hacia `--live-spot`, verificar **todos** los siguientes puntos al cumplirse los 30 días (~720 ciclos horarios `1h` y ~180 cierres `4h` UTC):
 
 - [ ] **Continuidad de ciclos (`B2-01`)**: `>= 99%` de las 720 horas UTC ejecutadas puntualmente (`*:00:15..25 UTC`), sin fallos repetidos de reloj (`ClockSkew`) ni `run.lock` colgados.
-- [ ] **Telemetría paralela (`A0_4H`)**: `180` cierres `4h` UTC (`00/04/08/12/16/20 UTC`) registrados en `state/m2b_shadow_4h_state.json` y `logs/m2b_audit_ledger.jsonl` con `SHADOW_4H_CYCLE`.
-- [ ] **Invariante contable**: `100%` de las líneas en `logs/m2b_audit_ledger.jsonl` con `"drift_1e8":0` y sello `fnv1a64_hex` válido (cero manipulaciones o truncamientos).
-- [ ] **Sin `HALT_LOCK` no resueltos**: Ningún evento inesperado de `HARD_DRAWDOWN_HALT`; cualquier drawdown registrado dentro de límites de riesgo esperados (`<= 25%` TWR).
-- [ ] **Comparativa `B2-01` (1h) vs `A0_4H` (4h)**: Evaluar TWR final, máximo drawdown TWR, rotación acumulada y arrastre de comisiones (`cum_sell_fees_usdt_1e8` + `cum_buy_fees_usdt_est_1e8`) para confirmar superioridad o equivalencia controlada de `B2-01`.
+- [ ] **Telemetría paralela (`A0_4H`)**: `180` cierres `4h` UTC (`00/04/08/12/16/20 UTC`) registrados en `state/m2b_shadow_4h_state.json` (`schema_version = 2`) y `logs/m2b_audit_ledger.jsonl` con `SHADOW_4H_CYCLE`.
+- [ ] **Invariante contable**: `100%` de las líneas en `logs/m2b_audit_ledger.jsonl` con `"drift_1e8":0` y sello `fnv1a64_hex` válido.
+- [ ] **Sin `HALT_LOCK` no resueltos**: Ningún evento inesperado de `HARD_DRAWDOWN_HALT`; drawdown observado `<= 25%` TWR.
+- [ ] **Comparativa `B2-01` (1h) vs `A0_4H` (4h) con `XAUTUSDT`**: Evaluar TWR final, máximo drawdown TWR y arrastre de comisiones (`cum_sell_fees_usdt_1e8` + `cum_buy_fees_usdt_est_1e8`), especialmente la contribución de rotación de `XAUTUSDT`.
 - [ ] **Checklist de promoción a `--live-spot` (cuando el operador apruebe)**:
   1. Configurar API Key Spot V5 de Bybit con permisos estrictos de **Spot Trade** (sin retiros, IP whitelisted al host Tokio).
   2. Confirmar cuenta Bybit en modo `UNIFIED` con capital inicial USDT depositado.

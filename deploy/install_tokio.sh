@@ -19,6 +19,11 @@ else
     echo "[2/6] Preserving existing ${TARGET_DIR}/.env..."
 fi
 
+if [[ -f "${STATE_DIR}/primary_state.json" ]] && grep -q '"schema_version"[[:space:]]*:[[:space:]]*1' "${STATE_DIR}/primary_state.json"; then
+    echo "WARNING: ${STATE_DIR}/primary_state.json uses schema_version=1 (v1.0.x)."
+    echo "         v1.1.0 enforces fail-closed schema_version=2; back up and archive v1 state files before starting the v1.1.0 timer."
+fi
+
 echo "[3/6] Building release binary with low CPU/IO priority..."
 cd "${REPO_DIR}"
 nice -n 19 ionice -c 3 cargo build --release

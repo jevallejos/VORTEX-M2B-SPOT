@@ -1,14 +1,14 @@
 use crate::domain::accounting::SpotPortfolioLedger;
 use crate::domain::error::DomainError;
 use crate::domain::types::{
-    InstrumentRules, Money1e8, Price1e8, Qty1e8, Symbol, WalletSnapshot, UNIVERSE_LEN,
+    AssetSymbol, InstrumentRules, Money1e8, Price1e8, Qty1e8, Universe, WalletSnapshot,
 };
 
 pub const EXTERNAL_CASH_TOLERANCE_1E8: i128 = 100_000; // 0.001 USDT
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseDiscrepancy {
-    pub symbol: Symbol,
+    pub symbol: AssetSymbol,
     pub ledger_qty_1e8: Qty1e8,
     pub wallet_qty_1e8: Qty1e8,
     pub diff_1e8: i128,
@@ -21,13 +21,32 @@ pub struct ReconcileReport {
     pub base_discrepancies: Vec<BaseDiscrepancy>,
 }
 
+fn check_len(field: &'static str, expected: usize, actual: usize) -> Result<(), DomainError> {
+    if actual != expected {
+        return Err(DomainError::CorruptStateLength {
+            field,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 pub fn reconcile_live_wallet(
+    universe: &Universe,
     ledger: &mut SpotPortfolioLedger,
     wallet: &WalletSnapshot,
-    rules: &[InstrumentRules; UNIVERSE_LEN],
-    prices: &[Price1e8; UNIVERSE_LEN],
+    rules: &[InstrumentRules],
+    prices: &[Price1e8],
     had_recent_orders: bool,
 ) -> Result<ReconcileReport, DomainError> {
+    let n = universe.len();
+    check_len("ledger.num_assets", n, ledger.num_assets())?;
+    check_len("wallet.coin_free_1e8", n, wallet.coin_free_1e8.len())?;
+    check_len("wallet.coin_locked_1e8", n, wallet.coin_locked_1e8.len())?;
+    check_len("rules", n, rules.len())?;
+    check_len("prices_1e8", n, prices.len())?;
+
     let wallet_usdt = wallet.usdt_free_1e8.checked_add(wallet.usdt_locked_1e8)?;
     let delta = wallet_usdt
         .raw()
@@ -48,16 +67,23 @@ pub fn reconcile_live_wallet(
     }
 
     let mut base_discrepancies = Vec::new();
-    for (i, sym) in Symbol::ALL.iter().copied().enumerate() {
+    for (id, sym) in universe.iter_with_ids() {
+        let i = id.index();
+        if rules[i].symbol != *sym {
+            return Err(DomainError::InvalidInstrumentRules(format!(
+                "reconcile rules[{i}] symbol '{}' does not match universe symbol '{sym}'",
+                rules[i].symbol
+            )));
+        }
         let wallet_coin = wallet.coin_free_1e8[i].checked_add(wallet.coin_locked_1e8[i])?;
-        let ledger_qty = ledger.position(sym).qty_1e8;
+        let ledger_qty = ledger.position(id)?.qty_1e8;
         let diff_1e8 = wallet_coin
             .raw()
             .checked_sub(ledger_qty.raw())
             .ok_or(DomainError::ArithmeticOverflow)?;
         if diff_1e8.abs() > rules[i].base_precision.raw() {
             base_discrepancies.push(BaseDiscrepancy {
-                symbol: sym,
+                symbol: sym.clone(),
                 ledger_qty_1e8: ledger_qty,
                 wallet_qty_1e8: wallet_coin,
                 diff_1e8,
@@ -76,43 +102,49 @@ pub fn reconcile_live_wallet(
 mod tests {
     use super::*;
 
-    fn mk_rules() -> [InstrumentRules; UNIVERSE_LEN] {
-        Symbol::ALL.map(|sym| InstrumentRules {
-            symbol: sym,
-            base_precision: Qty1e8(100_000), // 0.001
-            quote_precision: Money1e8(1_000_000),
-            min_order_qty: Qty1e8(100_000),
-            min_order_amt: Money1e8(500_000_000),
-            tick_size: Price1e8(1_000_000),
-            is_trading: true,
-        })
+    fn mk_rules(universe: &Universe) -> Vec<InstrumentRules> {
+        universe
+            .symbols()
+            .iter()
+            .map(|sym| InstrumentRules {
+                symbol: sym.clone(),
+                base_precision: Qty1e8(100_000), // 0.001
+                quote_precision: Money1e8(1_000_000),
+                min_order_qty: Qty1e8(100_000),
+                min_order_amt: Money1e8(500_000_000),
+                tick_size: Price1e8(1_000_000),
+                is_trading: true,
+            })
+            .collect()
     }
 
     #[test]
     fn reconcile_detects_deposit_and_base_mismatch() -> Result<(), DomainError> {
-        let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000))?;
-        let rules = mk_rules();
-        let prices = [Price1e8(10_000_000_000); UNIVERSE_LEN];
+        let universe = Universe::default_universe()?;
+        let n = universe.len();
+        let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000), n)?;
+        let rules = mk_rules(&universe);
+        let prices = vec![Price1e8(10_000_000_000); n];
+
+        let mut coin_free = vec![Qty1e8::ZERO; n];
+        coin_free[0] = Qty1e8(500_000); // BTC mismatch
+        coin_free[5] = Qty1e8(300_000); // XAUT mismatch
 
         let wallet = WalletSnapshot {
             usdt_free_1e8: Money1e8(125_000_000_000), // +250 USDT external deposit
             usdt_locked_1e8: Money1e8::ZERO,
-            coin_free_1e8: [
-                Qty1e8(500_000), // 0.005 > 0.001 precision -> mismatch!
-                Qty1e8::ZERO,
-                Qty1e8::ZERO,
-                Qty1e8::ZERO,
-                Qty1e8::ZERO,
-            ],
-            coin_locked_1e8: [Qty1e8::ZERO; UNIVERSE_LEN],
+            coin_free_1e8: coin_free,
+            coin_locked_1e8: vec![Qty1e8::ZERO; n],
             fetched_at_ms: 1_700_000_000_000,
         };
 
-        let report = reconcile_live_wallet(&mut ledger, &wallet, &rules, &prices, false)?;
+        let report =
+            reconcile_live_wallet(&universe, &mut ledger, &wallet, &rules, &prices, false)?;
         assert_eq!(report.external_cash_delta_1e8, Money1e8(25_000_000_000));
         assert_eq!(ledger.cash_1e8(), Money1e8(125_000_000_000));
-        assert_eq!(report.base_discrepancies.len(), 1);
-        assert_eq!(report.base_discrepancies[0].symbol, Symbol::BtcUsdt);
+        assert_eq!(report.base_discrepancies.len(), 2);
+        assert_eq!(report.base_discrepancies[0].symbol.as_str(), "BTCUSDT");
+        assert_eq!(report.base_discrepancies[1].symbol.as_str(), "XAUTUSDT");
         Ok(())
     }
 }

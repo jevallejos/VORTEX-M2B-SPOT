@@ -13,10 +13,10 @@ use crate::domain::types::{
     make_order_link_id, mul_div_floor_nonneg, mul_div_round, AuditEntry, Candle, DomainEvent,
     EnginePersistedState, ExecutionMode, InstrumentRules, Money1e8, OrderRequest, OrderSide,
     PlannedOrder, PortfolioSnapshot, PositionState, Price1e8, Qty1e8, Rate1e10,
-    Shadow4hPersistedState, Symbol, WalletSnapshot, ONE_HOUR_MS, SCALE_1E8, UNIVERSE_LEN,
+    Shadow4hPersistedState, Universe, WalletSnapshot, ONE_HOUR_MS, SCALE_1E8, STATE_SCHEMA_VERSION,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = STATE_SCHEMA_VERSION;
 const KLINE_FETCH_LIMIT: usize = 700;
 const PAPER_FEE_BPS: i128 = 10;
 const PAPER_SLIPPAGE_BPS: i128 = 2;
@@ -27,6 +27,7 @@ const MS_PER_DAY: i64 = 86_400_000;
 
 #[derive(Debug, Clone)]
 pub struct CycleConfig {
+    pub universe: Universe,
     pub mode: ExecutionMode,
     pub paper_initial_cash_1e8: Money1e8,
     pub live_execution_env_flag: bool,
@@ -78,6 +79,8 @@ impl<'a> RunHourlyCycleUseCase<'a> {
 
     pub fn run(&self, cfg: &CycleConfig) -> Result<CycleOutcome, AppError> {
         let _run_lock = self.store.acquire_run_lock()?;
+        let universe = &cfg.universe;
+        let n = universe.len();
 
         if cfg.mode == ExecutionMode::LiveSpot {
             if !(cfg.live_execution_env_flag && cfg.live_ack_valid) {
@@ -102,33 +105,69 @@ impl<'a> RunHourlyCycleUseCase<'a> {
             .into());
         }
 
-        let rules = self.market.fetch_instruments_info(&Symbol::ALL)?;
-        let tickers = self.market.fetch_tickers(&Symbol::ALL)?;
-        let mut prices = [Price1e8::ZERO; UNIVERSE_LEN];
+        let rules = self.market.fetch_instruments_info(universe.symbols())?;
+        if rules.len() != n {
+            return Err(InfraError::Parse(format!(
+                "instruments-info length mismatch: expected {n}, got {}",
+                rules.len()
+            ))
+            .into());
+        }
+        for (id, sym) in universe.iter_with_ids() {
+            if rules[id.index()].symbol != *sym {
+                return Err(InfraError::Parse(format!(
+                    "instruments-info symbol mismatch at index {}: expected {}, got {}",
+                    id.index(),
+                    sym,
+                    rules[id.index()].symbol
+                ))
+                .into());
+            }
+        }
+
+        let tickers = self.market.fetch_tickers(universe.symbols())?;
+        if tickers.len() != n {
+            return Err(InfraError::Parse(format!(
+                "tickers length mismatch: expected {n}, got {}",
+                tickers.len()
+            ))
+            .into());
+        }
+        let mut prices = Vec::with_capacity(n);
         for (i, t) in tickers.iter().enumerate() {
+            if let Some(expected_sym) = universe.symbols().get(i) {
+                if t.symbol != *expected_sym {
+                    return Err(InfraError::Parse(format!(
+                        "ticker symbol mismatch at index {i}: expected {expected_sym}, got {}",
+                        t.symbol
+                    ))
+                    .into());
+                }
+            }
             if t.last.raw() <= 0 {
                 return Err(
                     DomainError::InvalidParameter("ticker last price must be positive").into(),
                 );
             }
-            prices[i] = t.last;
+            prices.push(t.last);
         }
 
-        let mut closed_per_sym: Vec<Vec<Candle>> = Vec::with_capacity(UNIVERSE_LEN);
-        for sym in Symbol::ALL {
+        let mut closed_per_sym: Vec<Vec<Candle>> = Vec::with_capacity(n);
+        for sym in universe.symbols() {
             let raw = self.market.fetch_klines_1h(sym, KLINE_FETCH_LIMIT)?;
             let closed = filter_strictly_closed_1h(&raw, server_time_ms)?;
             closed_per_sym.push(closed);
         }
 
         let (aligned_1h, common_last_open_ts) =
-            align_candles_to_common_latest(closed_per_sym, MIN_CLOSED_1H_CANDLES)?;
+            align_candles_to_common_latest(closed_per_sym, n, MIN_CLOSED_1H_CANDLES)?;
         let closed_hour_ts_ms = common_last_open_ts
             .checked_add(ONE_HOUR_MS)
             .ok_or(DomainError::ArithmeticOverflow)?;
 
-        let primary_opt = self.store.load_primary_state()?;
+        let primary_opt = self.store.load_primary_state(universe)?;
         if let Some(ref prev_state) = primary_opt {
+            prev_state.validate_against(universe)?;
             if closed_hour_ts_ms <= prev_state.last_processed_hour_ts_ms {
                 return Ok(CycleOutcome::AlreadyProcessed { closed_hour_ts_ms });
             }
@@ -137,21 +176,21 @@ impl<'a> RunHourlyCycleUseCase<'a> {
         let (mut ledger, mut last_daily_summary_day_utc, mut last_order_ts_ms, bootstrap_wallet) =
             match primary_opt {
                 Some(prev) => (
-                    SpotPortfolioLedger::from_snapshot(prev.portfolio)?,
+                    SpotPortfolioLedger::from_snapshot(prev.portfolio, n)?,
                     prev.last_daily_summary_day_utc,
                     prev.last_order_ts_ms,
                     None,
                 ),
                 None => match cfg.mode {
                     ExecutionMode::Paper => (
-                        SpotPortfolioLedger::new(cfg.paper_initial_cash_1e8)?,
+                        SpotPortfolioLedger::new(cfg.paper_initial_cash_1e8, n)?,
                         -1i64,
                         0i64,
                         None,
                     ),
                     ExecutionMode::LiveSpot => {
-                        let wallet = self.exec.fetch_wallet_snapshot()?;
-                        let init_ledger = init_live_ledger_from_wallet(&wallet, &prices)?;
+                        let wallet = self.exec.fetch_wallet_snapshot(universe)?;
+                        let init_ledger = init_live_ledger_from_wallet(universe, &wallet, &prices)?;
                         (init_ledger, -1i64, 0i64, Some(wallet))
                     }
                 },
@@ -163,12 +202,18 @@ impl<'a> RunHourlyCycleUseCase<'a> {
         if cfg.mode == ExecutionMode::LiveSpot {
             let wallet = match bootstrap_wallet {
                 Some(w) => w,
-                None => self.exec.fetch_wallet_snapshot()?,
+                None => self.exec.fetch_wallet_snapshot(universe)?,
             };
             let had_recent_orders = last_order_ts_ms > 0
                 && server_time_ms.saturating_sub(last_order_ts_ms) <= RECENT_ORDER_WINDOW_MS;
-            let report =
-                reconcile_live_wallet(&mut ledger, &wallet, &rules, &prices, had_recent_orders)?;
+            let report = reconcile_live_wallet(
+                universe,
+                &mut ledger,
+                &wallet,
+                &rules,
+                &prices,
+                had_recent_orders,
+            )?;
 
             if report.external_cash_delta_1e8.raw() != 0 {
                 let delta = report.external_cash_delta_1e8.raw();
@@ -264,6 +309,7 @@ impl<'a> RunHourlyCycleUseCase<'a> {
         let allow_buys = !drain_mode && !halt_lock && !ledger.is_halted();
 
         let planned_orders = plan_rebalance_orders(&RebalancePlanInput {
+            universe,
             cash_1e8: ledger.cash_1e8(),
             positions: ledger.positions(),
             prices_1e8: &prices,
@@ -297,10 +343,12 @@ impl<'a> RunHourlyCycleUseCase<'a> {
             }
             ExecutionMode::LiveSpot => {
                 for ord in &planned_orders {
-                    let order_link_id = make_order_link_id(closed_hour_ts_ms, ord.symbol, ord.side);
+                    let order_link_id =
+                        make_order_link_id(closed_hour_ts_ms, &ord.symbol, ord.side);
                     let existing = self
                         .exec
-                        .query_order_by_link_id(ord.symbol, &order_link_id)?;
+                        .query_order_by_link_id(&ord.symbol, &order_link_id)?;
+                    let idx = ord.symbol_id.index();
                     let fill = match existing {
                         Some(f) => f,
                         None => {
@@ -311,7 +359,7 @@ impl<'a> RunHourlyCycleUseCase<'a> {
                                     LIVE_BUY_CASH_CAP_DEN,
                                 )?;
                                 let capped = Money1e8(ord.quote_spend_1e8.raw().min(max_spend));
-                                if capped < rules[ord.symbol.index()].min_order_amt {
+                                if capped < rules[idx].min_order_amt {
                                     continue;
                                 }
                                 capped
@@ -320,11 +368,11 @@ impl<'a> RunHourlyCycleUseCase<'a> {
                             };
 
                             let req = OrderRequest {
-                                symbol: ord.symbol,
+                                symbol: ord.symbol.clone(),
                                 side: ord.side,
                                 quote_spend_1e8: quote_spend,
                                 base_qty_1e8: ord.base_qty_1e8,
-                                base_precision: rules[ord.symbol.index()].base_precision,
+                                base_precision: rules[idx].base_precision,
                                 order_link_id: order_link_id.clone(),
                                 reference_price_1e8: ord.reference_price_1e8,
                             };
@@ -338,11 +386,7 @@ impl<'a> RunHourlyCycleUseCase<'a> {
                         }
                     };
 
-                    apply_live_fill(
-                        &mut ledger,
-                        &fill,
-                        rules[fill.symbol.index()].base_precision,
-                    )?;
+                    apply_live_fill(universe, &mut ledger, &fill, &rules)?;
                     orders_executed += 1;
                     last_order_ts_ms = fill.filled_at_ms.max(server_time_ms);
 
@@ -400,6 +444,7 @@ impl<'a> RunHourlyCycleUseCase<'a> {
 
         let persisted = EnginePersistedState {
             schema_version: SCHEMA_VERSION,
+            symbols: universe.symbols().to_vec(),
             mode: cfg.mode,
             last_processed_hour_ts_ms: closed_hour_ts_ms,
             last_daily_summary_day_utc,
@@ -416,6 +461,7 @@ impl<'a> RunHourlyCycleUseCase<'a> {
 
         let shadow_4h_updated = self.run_shadow_4h_if_due(
             cfg,
+            universe,
             &aligned_1h,
             &rules,
             common_last_open_ts,
@@ -467,7 +513,7 @@ impl<'a> RunHourlyCycleUseCase<'a> {
         mode: ExecutionMode,
         server_time_ms: i64,
         closed_hour_ts_ms: i64,
-        prices: &[Price1e8; UNIVERSE_LEN],
+        prices: &[Price1e8],
         mtm_event: &Option<DomainEvent>,
     ) -> Result<(), AppError> {
         ledger.set_halted(true);
@@ -506,11 +552,13 @@ impl<'a> RunHourlyCycleUseCase<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_shadow_4h_if_due(
         &self,
         cfg: &CycleConfig,
-        aligned_1h: &[Vec<Candle>; UNIVERSE_LEN],
-        rules: &[InstrumentRules; UNIVERSE_LEN],
+        universe: &Universe,
+        aligned_1h: &[Vec<Candle>],
+        rules: &[InstrumentRules],
         common_last_open_ts: i64,
         closed_hour_ts_ms: i64,
         server_time_ms: i64,
@@ -519,22 +567,25 @@ impl<'a> RunHourlyCycleUseCase<'a> {
             return Ok(false);
         }
 
-        let shadow_opt = self.store.load_shadow_4h_state()?;
+        let shadow_opt = self.store.load_shadow_4h_state(universe)?;
         if let Some(ref prev_shadow) = shadow_opt {
+            prev_shadow.validate_against(universe)?;
             if closed_hour_ts_ms <= prev_shadow.last_processed_4h_close_ts_ms {
                 return Ok(false);
             }
         }
 
-        let mut bars_4h_vec: Vec<Vec<Candle>> = Vec::with_capacity(UNIVERSE_LEN);
+        let n = universe.len();
+        let mut bars_4h_vec: Vec<Vec<Candle>> = Vec::with_capacity(n);
         for sym_1h in aligned_1h {
             bars_4h_vec.push(aggregate_1h_to_4h(sym_1h)?);
         }
-        let (aligned_4h, _) = align_candles_to_common_latest(bars_4h_vec, MIN_CLOSED_4H_CANDLES)?;
+        let (aligned_4h, _) =
+            align_candles_to_common_latest(bars_4h_vec, n, MIN_CLOSED_4H_CANDLES)?;
 
         let sig_4h = compute_a0_4h_signals(&aligned_4h)?;
-        let mut shadow_prices = [Price1e8::ZERO; UNIVERSE_LEN];
-        for (i, sym_bars) in aligned_4h.iter().enumerate() {
+        let mut shadow_prices = Vec::with_capacity(n);
+        for sym_bars in &aligned_4h {
             let last_close =
                 sym_bars
                     .last()
@@ -543,17 +594,18 @@ impl<'a> RunHourlyCycleUseCase<'a> {
                         required: MIN_CLOSED_4H_CANDLES,
                         actual: 0,
                     })?;
-            shadow_prices[i] = Price1e8::from_f64_checked(last_close)?;
+            shadow_prices.push(Price1e8::from_f64_checked(last_close)?);
         }
 
         let mut shadow_ledger = match shadow_opt {
-            Some(prev) => SpotPortfolioLedger::from_snapshot(prev.portfolio)?,
-            None => SpotPortfolioLedger::new(cfg.paper_initial_cash_1e8)?,
+            Some(prev) => SpotPortfolioLedger::from_snapshot(prev.portfolio, n)?,
+            None => SpotPortfolioLedger::new(cfg.paper_initial_cash_1e8, n)?,
         };
 
         let _ = shadow_ledger.mark_to_market(&shadow_prices)?;
         let pre_weights = shadow_ledger.current_weights(&shadow_prices)?;
         let planned = plan_rebalance_orders(&RebalancePlanInput {
+            universe,
             cash_1e8: shadow_ledger.cash_1e8(),
             positions: shadow_ledger.positions(),
             prices_1e8: &shadow_prices,
@@ -589,6 +641,7 @@ impl<'a> RunHourlyCycleUseCase<'a> {
 
         let shadow_state = Shadow4hPersistedState {
             schema_version: SCHEMA_VERSION,
+            symbols: universe.symbols().to_vec(),
             last_processed_4h_close_ts_ms: closed_hour_ts_ms,
             portfolio: shadow_ledger.snapshot(),
             last_target_weights: sig_4h.target_weights,
@@ -624,20 +677,49 @@ impl<'a> RunHourlyCycleUseCase<'a> {
 }
 
 fn init_live_ledger_from_wallet(
+    universe: &Universe,
     wallet: &WalletSnapshot,
-    prices: &[Price1e8; UNIVERSE_LEN],
+    prices: &[Price1e8],
 ) -> Result<SpotPortfolioLedger, DomainError> {
+    let n = universe.len();
+    if wallet.coin_free_1e8.len() != n {
+        return Err(DomainError::CorruptStateLength {
+            field: "wallet.coin_free_1e8",
+            expected: n,
+            actual: wallet.coin_free_1e8.len(),
+        });
+    }
+    if wallet.coin_locked_1e8.len() != n {
+        return Err(DomainError::CorruptStateLength {
+            field: "wallet.coin_locked_1e8",
+            expected: n,
+            actual: wallet.coin_locked_1e8.len(),
+        });
+    }
+    if prices.len() != n {
+        return Err(DomainError::CorruptStateLength {
+            field: "prices_1e8",
+            expected: n,
+            actual: prices.len(),
+        });
+    }
+
     let cash_1e8 = wallet.usdt_free_1e8.checked_add(wallet.usdt_locked_1e8)?;
-    let mut positions = [PositionState::default(); UNIVERSE_LEN];
+    let mut positions = Vec::with_capacity(n);
     let mut total_deposits = cash_1e8.raw();
 
-    for i in 0..UNIVERSE_LEN {
-        let qty = wallet.coin_free_1e8[i].checked_add(wallet.coin_locked_1e8[i])?;
-        let cost = mul_div_floor_nonneg(qty.raw(), prices[i].raw(), SCALE_1E8)?;
-        positions[i] = PositionState {
+    for ((free, locked), price) in wallet
+        .coin_free_1e8
+        .iter()
+        .zip(wallet.coin_locked_1e8.iter())
+        .zip(prices.iter())
+    {
+        let qty = free.checked_add(*locked)?;
+        let cost = mul_div_floor_nonneg(qty.raw(), price.raw(), SCALE_1E8)?;
+        positions.push(PositionState {
             qty_1e8: qty,
             cost_basis_usdt_1e8: Money1e8(cost),
-        };
+        });
         total_deposits = total_deposits
             .checked_add(cost)
             .ok_or(DomainError::ArithmeticOverflow)?;
@@ -649,7 +731,7 @@ fn init_live_ledger_from_wallet(
         total_deposits_1e8: Money1e8(total_deposits),
         realized_pnl_gross_1e8: Money1e8::ZERO,
         cum_sell_fees_usdt_1e8: Money1e8::ZERO,
-        cum_buy_fees_base_1e8: [Qty1e8::ZERO; UNIVERSE_LEN],
+        cum_buy_fees_base_1e8: vec![Qty1e8::ZERO; n],
         cum_buy_fees_usdt_est_1e8: Money1e8::ZERO,
         twr_index_1e10: Rate1e10::ONE,
         twr_peak_1e10: Rate1e10::ONE,
@@ -657,19 +739,22 @@ fn init_live_ledger_from_wallet(
         halted: false,
     };
 
-    let ledger = SpotPortfolioLedger::from_snapshot(snap)?;
+    let ledger = SpotPortfolioLedger::from_snapshot(snap, n)?;
     ledger.assert_zero_drift(prices)?;
     Ok(ledger)
 }
 
 fn align_candles_to_common_latest(
     mut per_sym: Vec<Vec<Candle>>,
+    expected_len: usize,
     min_candles: usize,
-) -> Result<([Vec<Candle>; UNIVERSE_LEN], i64), DomainError> {
-    if per_sym.len() != UNIVERSE_LEN {
-        return Err(DomainError::InvalidParameter(
-            "expected exactly UNIVERSE_LEN candle series",
-        ));
+) -> Result<(Vec<Vec<Candle>>, i64), DomainError> {
+    if per_sym.len() != expected_len {
+        return Err(DomainError::CorruptStateLength {
+            field: "candles_by_symbol",
+            expected: expected_len,
+            actual: per_sym.len(),
+        });
     }
 
     let mut min_last_ts: Option<i64> = None;
@@ -692,7 +777,7 @@ fn align_candles_to_common_latest(
         actual: 0,
     })?;
 
-    // Find the greatest timestamp <= target_last_ts present in all 5 series.
+    // Find the greatest timestamp <= target_last_ts present in all universe series.
     let mut common_ts = None;
     for c in per_sym[0].iter().rev() {
         if c.open_ts_ms > target_last_ts {
@@ -723,30 +808,27 @@ fn align_candles_to_common_latest(
         }
     }
 
-    let arr: [Vec<Candle>; UNIVERSE_LEN] = per_sym.try_into().map_err(|_| {
-        DomainError::InvalidParameter("failed to convert candle vector to fixed universe array")
-    })?;
-    Ok((arr, common_last_open_ts))
+    Ok((per_sym, common_last_open_ts))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn simulate_paper_orders(
     ledger: &mut SpotPortfolioLedger,
     planned: &[PlannedOrder],
-    rules: &[InstrumentRules; UNIVERSE_LEN],
+    rules: &[InstrumentRules],
     engine_name: &str,
     mode: ExecutionMode,
     server_time_ms: i64,
     closed_hour_ts_ms: i64,
-    prices: &[Price1e8; UNIVERSE_LEN],
+    prices: &[Price1e8],
 ) -> Result<(usize, Vec<AuditEntry>), DomainError> {
     let mut count = 0usize;
     let mut audits = Vec::with_capacity(planned.len());
 
     for ord in planned {
-        let idx = ord.symbol.index();
+        let idx = ord.symbol_id.index();
         let base_prec = rules[idx].base_precision;
-        let order_link_id = make_order_link_id(closed_hour_ts_ms, ord.symbol, ord.side);
+        let order_link_id = make_order_link_id(closed_hour_ts_ms, &ord.symbol, ord.side);
         let ref_p = ord.reference_price_1e8.raw();
 
         match ord.side {
@@ -773,7 +855,7 @@ fn simulate_paper_orders(
                     continue;
                 }
 
-                ledger.apply_buy_fill(ord.symbol, spend, gross_base, fee_base, base_prec)?;
+                ledger.apply_buy_fill(ord.symbol_id, spend, gross_base, fee_base, base_prec)?;
                 count += 1;
                 let eq = ledger.equity_1e8(prices)?;
                 let drift = ledger.drift_mtm_1e8(prices)?;
@@ -801,10 +883,8 @@ fn simulate_paper_orders(
                 if exec_price <= 0 {
                     continue;
                 }
-                let sell_qty = ord
-                    .base_qty_1e8
-                    .min(ledger.position(ord.symbol).qty_1e8)
-                    .floor_to_step(base_prec)?;
+                let pos_qty = ledger.position(ord.symbol_id)?.qty_1e8;
+                let sell_qty = ord.base_qty_1e8.min(pos_qty).floor_to_step(base_prec)?;
                 if sell_qty < rules[idx].min_order_qty {
                     continue;
                 }
@@ -812,7 +892,13 @@ fn simulate_paper_orders(
                     Money1e8(mul_div_floor_nonneg(sell_qty.raw(), exec_price, SCALE_1E8)?);
                 let fee_usdt = Money1e8(mul_div_round(gross_quote.raw(), PAPER_FEE_BPS, 10_000)?);
 
-                ledger.apply_sell_fill(ord.symbol, sell_qty, gross_quote, fee_usdt)?;
+                ledger.apply_sell_fill(
+                    ord.symbol_id,
+                    ord.symbol.as_str(),
+                    sell_qty,
+                    gross_quote,
+                    fee_usdt,
+                )?;
                 count += 1;
                 let eq = ledger.equity_1e8(prices)?;
                 let drift = ledger.drift_mtm_1e8(prices)?;
@@ -856,10 +942,16 @@ fn guard_live_order_request(
 }
 
 fn apply_live_fill(
+    universe: &Universe,
     ledger: &mut SpotPortfolioLedger,
     fill: &crate::domain::types::FillReport,
-    base_precision: Qty1e8,
+    rules: &[InstrumentRules],
 ) -> Result<(), DomainError> {
+    let symbol_id = universe
+        .symbol_id(&fill.symbol)
+        .ok_or_else(|| DomainError::UnknownSymbol(fill.symbol.as_str().to_string()))?;
+    let base_precision = rules[symbol_id.index()].base_precision;
+
     match fill.side {
         OrderSide::Buy => {
             let fee_base = if fill.fee_in_base {
@@ -872,7 +964,7 @@ fn apply_live_fill(
                 )?)
             };
             ledger.apply_buy_fill(
-                fill.symbol,
+                symbol_id,
                 fill.exec_quote_1e8,
                 fill.exec_qty_base_1e8,
                 fee_base,
@@ -890,7 +982,8 @@ fn apply_live_fill(
                 )?)
             };
             ledger.apply_sell_fill(
-                fill.symbol,
+                symbol_id,
+                fill.symbol.as_str(),
                 fill.exec_qty_base_1e8,
                 fill.exec_quote_1e8,
                 fee_usdt,
@@ -905,7 +998,7 @@ mod tests {
 
     use super::*;
     use crate::domain::ports::RunLockGuard;
-    use crate::domain::types::TickerSnapshot;
+    use crate::domain::types::{AssetSymbol, TickerSnapshot};
     use crate::infrastructure::bybit_spot_v5::PaperNoopExecutionPort;
 
     struct FixedClock(i64);
@@ -925,40 +1018,46 @@ mod tests {
         }
         fn fetch_instruments_info(
             &self,
-            symbols: &[Symbol; UNIVERSE_LEN],
-        ) -> Result<[InstrumentRules; UNIVERSE_LEN], InfraError> {
-            Ok(symbols.map(|sym| InstrumentRules {
-                symbol: sym,
-                base_precision: Qty1e8(100_000),
-                quote_precision: Money1e8(1_000_000),
-                min_order_qty: Qty1e8(100_000),
-                min_order_amt: Money1e8(500_000_000),
-                tick_size: Price1e8(1_000_000),
-                is_trading: true,
-            }))
+            symbols: &[AssetSymbol],
+        ) -> Result<Vec<InstrumentRules>, InfraError> {
+            Ok(symbols
+                .iter()
+                .map(|sym| InstrumentRules {
+                    symbol: sym.clone(),
+                    base_precision: Qty1e8(100_000),
+                    quote_precision: Money1e8(1_000_000),
+                    min_order_qty: Qty1e8(100_000),
+                    min_order_amt: Money1e8(500_000_000),
+                    tick_size: Price1e8(1_000_000),
+                    is_trading: true,
+                })
+                .collect())
         }
         fn fetch_klines_1h(
             &self,
-            _symbol: Symbol,
+            _symbol: &AssetSymbol,
             _limit: usize,
         ) -> Result<Vec<Candle>, InfraError> {
             Ok(self.candles.clone())
         }
         fn fetch_tickers(
             &self,
-            symbols: &[Symbol; UNIVERSE_LEN],
-        ) -> Result<[TickerSnapshot; UNIVERSE_LEN], InfraError> {
+            symbols: &[AssetSymbol],
+        ) -> Result<Vec<TickerSnapshot>, InfraError> {
             let last_p = self
                 .candles
                 .last()
                 .and_then(|c| Price1e8::from_f64_checked(c.close).ok())
                 .unwrap_or(Price1e8(10_000_000_000));
-            Ok(symbols.map(|sym| TickerSnapshot {
-                symbol: sym,
-                bid1: last_p,
-                ask1: last_p,
-                last: last_p,
-            }))
+            Ok(symbols
+                .iter()
+                .map(|sym| TickerSnapshot {
+                    symbol: sym.clone(),
+                    bid1: last_p,
+                    ask1: last_p,
+                    last: last_p,
+                })
+                .collect())
         }
     }
 
@@ -992,8 +1091,22 @@ mod tests {
             }
             Ok(())
         }
-        fn load_primary_state(&self) -> Result<Option<EnginePersistedState>, InfraError> {
-            Ok(self.primary.lock().ok().and_then(|g| g.clone()))
+        fn load_primary_state(
+            &self,
+            expected_universe: &Universe,
+        ) -> Result<Option<EnginePersistedState>, InfraError> {
+            let guard = self
+                .primary
+                .lock()
+                .map_err(|_| InfraError::Io("primary mutex poisoned".to_string()))?;
+            match &*guard {
+                None => Ok(None),
+                Some(st) => {
+                    st.validate_against(expected_universe)
+                        .map_err(|e| InfraError::Parse(e.to_string()))?;
+                    Ok(Some(st.clone()))
+                }
+            }
         }
         fn save_primary_state(&self, state: &EnginePersistedState) -> Result<(), InfraError> {
             if let Ok(mut g) = self.primary.lock() {
@@ -1001,8 +1114,22 @@ mod tests {
             }
             Ok(())
         }
-        fn load_shadow_4h_state(&self) -> Result<Option<Shadow4hPersistedState>, InfraError> {
-            Ok(self.shadow.lock().ok().and_then(|g| g.clone()))
+        fn load_shadow_4h_state(
+            &self,
+            expected_universe: &Universe,
+        ) -> Result<Option<Shadow4hPersistedState>, InfraError> {
+            let guard = self
+                .shadow
+                .lock()
+                .map_err(|_| InfraError::Io("shadow mutex poisoned".to_string()))?;
+            match &*guard {
+                None => Ok(None),
+                Some(st) => {
+                    st.validate_against(expected_universe)
+                        .map_err(|e| InfraError::Parse(e.to_string()))?;
+                    Ok(Some(st.clone()))
+                }
+            }
         }
         fn save_shadow_4h_state(&self, state: &Shadow4hPersistedState) -> Result<(), InfraError> {
             if let Ok(mut g) = self.shadow.lock() {
@@ -1033,6 +1160,7 @@ mod tests {
 
     #[test]
     fn paper_cycle_executes_idempotently_and_updates_shadow_4h() -> Result<(), AppError> {
+        let universe = Universe::default_universe()?;
         let mut candles = Vec::with_capacity(620);
         for k in 0..620 {
             let p = 100.0 + (k as f64) * 0.1;
@@ -1058,6 +1186,7 @@ mod tests {
 
         let uc = RunHourlyCycleUseCase::new(&clock, &market, &exec, &store, &notifier);
         let cfg = CycleConfig {
+            universe,
             mode: ExecutionMode::Paper,
             paper_initial_cash_1e8: Money1e8(100_000_000_000),
             live_execution_env_flag: false,
@@ -1105,7 +1234,8 @@ mod tests {
     }
 
     #[test]
-    fn live_spot_double_safety_lock_denies_without_ack() {
+    fn live_spot_double_safety_lock_denies_without_ack() -> Result<(), DomainError> {
+        let universe = Universe::default_universe()?;
         let clock = FixedClock(1_700_000_000_000);
         let market = MockMarket {
             server_time_ms: 1_700_000_000_000,
@@ -1117,6 +1247,7 @@ mod tests {
         let uc = RunHourlyCycleUseCase::new(&clock, &market, &exec, &store, &notifier);
 
         let cfg = CycleConfig {
+            universe,
             mode: ExecutionMode::LiveSpot,
             paper_initial_cash_1e8: Money1e8(100_000_000_000),
             live_execution_env_flag: true,
@@ -1127,12 +1258,15 @@ mod tests {
 
         let res = uc.run(&cfg);
         assert!(matches!(res, Err(AppError::LiveSafetyLockDenied(_))));
+        Ok(())
     }
 
     #[test]
-    fn defensive_buy_guard_blocks_buys_under_drain_or_halt_and_permits_sells() {
+    fn defensive_buy_guard_blocks_buys_under_drain_or_halt_and_permits_sells(
+    ) -> Result<(), DomainError> {
+        let btc = AssetSymbol::new("BTCUSDT")?;
         let buy_req = OrderRequest {
-            symbol: Symbol::BtcUsdt,
+            symbol: btc.clone(),
             side: OrderSide::Buy,
             quote_spend_1e8: Money1e8(10_000_000_000),
             base_qty_1e8: Qty1e8(10_000_000),
@@ -1141,7 +1275,7 @@ mod tests {
             reference_price_1e8: Price1e8(100_000_000_000),
         };
         let sell_req = OrderRequest {
-            symbol: Symbol::BtcUsdt,
+            symbol: btc,
             side: OrderSide::Sell,
             quote_spend_1e8: Money1e8(10_000_000_000),
             base_qty_1e8: Qty1e8(10_000_000),
@@ -1168,10 +1302,12 @@ mod tests {
         assert!(guard_live_order_request(&sell_req, true, false, false).is_ok());
         assert!(guard_live_order_request(&sell_req, false, true, false).is_ok());
         assert!(guard_live_order_request(&sell_req, false, false, true).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn live_spot_halt_lock_rejects_cycle_fail_closed() {
+    fn live_spot_halt_lock_rejects_cycle_fail_closed() -> Result<(), AppError> {
+        let universe = Universe::default_universe()?;
         let clock = FixedClock(1_700_000_000_000);
         let market = MockMarket {
             server_time_ms: 1_700_000_000_000,
@@ -1179,11 +1315,12 @@ mod tests {
         };
         let exec = PaperNoopExecutionPort;
         let store = MemStore::default();
-        assert!(store.write_halt_lock("manual halt test").is_ok());
+        store.write_halt_lock("manual halt test")?;
         let notifier = MemNotifier::default();
         let uc = RunHourlyCycleUseCase::new(&clock, &market, &exec, &store, &notifier);
 
         let cfg = CycleConfig {
+            universe,
             mode: ExecutionMode::LiveSpot,
             paper_initial_cash_1e8: Money1e8(100_000_000_000),
             live_execution_env_flag: true,
@@ -1194,5 +1331,6 @@ mod tests {
 
         let res = uc.run(&cfg);
         assert!(matches!(res, Err(AppError::HaltLockActive(_))));
+        Ok(())
     }
 }

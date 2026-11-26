@@ -190,18 +190,19 @@ fn gitignore_env_example_and_secret_hygiene() -> TestResult {
     );
     assert!(gi_lines.contains(&"logs/"), ".gitignore must exclude logs/");
 
-    // 2) Verify .env.example contains exact empty placeholders
+    // 2) Verify .env.example contains exact empty placeholders & v1.1.0 default universe
     let env_example = fs::read_to_string(root.join(".env.example"))?;
     let env_lines: Vec<&str> = env_example.lines().map(str::trim).collect();
-    for required_empty in [
+    for required in [
         "BYBIT_API_KEY=",
         "BYBIT_API_SECRET=",
         "TELEGRAM_BOT_TOKEN=",
         "TELEGRAM_CHAT_ID=",
+        "M2B_UNIVERSE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT",
     ] {
         assert!(
-            env_lines.contains(&required_empty),
-            ".env.example missing empty placeholder '{required_empty}'"
+            env_lines.contains(&required),
+            ".env.example missing required entry '{required}'"
         );
     }
 
@@ -232,6 +233,47 @@ fn gitignore_env_example_and_secret_hygiene() -> TestResult {
             .into());
         }
     }
+
+    Ok(())
+}
+
+#[test]
+fn v110_release_metadata_and_v102_regression_guards() -> TestResult {
+    let root = repo_root();
+
+    let cargo_toml = fs::read_to_string(root.join("Cargo.toml"))?;
+    assert!(
+        cargo_toml.contains("version = \"1.1.0\""),
+        "Cargo.toml must specify version = \"1.1.0\""
+    );
+
+    let timer = fs::read_to_string(root.join("deploy").join("vortex-m2b-spot.timer"))?;
+    assert!(
+        timer.contains("OnCalendar=*-*-* *:00:15 UTC"),
+        "timer must preserve OnCalendar=*-*-* *:00:15 UTC"
+    );
+    assert!(
+        timer.contains("RandomizedDelaySec=10"),
+        "timer must preserve RandomizedDelaySec=10"
+    );
+
+    let mut src_files = Vec::new();
+    collect_files_recursive(&root.join("src"), &mut src_files)?;
+    let legacy_const = concat!("UNIVERSE", "_LEN");
+    for path in src_files {
+        if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            let text = fs::read_to_string(&path)?;
+            assert!(
+                !text.contains(legacy_const),
+                "legacy fixed-universe symbol '{legacy_const}' found in {}",
+                path.display()
+            );
+        }
+    }
+
+    let types_rs = fs::read_to_string(root.join("src").join("domain").join("types.rs"))?;
+    assert!(types_rs.contains("pub const STATE_SCHEMA_VERSION: u32 = 2;"));
+    assert!(types_rs.contains("XAUTUSDT"));
 
     Ok(())
 }

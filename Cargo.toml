@@ -1,6 +1,6 @@
 [package]
 name = "vortex-m2b-spot"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.71"
 description = "VORTEX-M2B-SPOT 1h Spot 0x TSMOM Vol-Targeted engine with parallel 4h shadow telemetry"

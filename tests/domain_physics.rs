@@ -5,12 +5,14 @@ use vortex_m2b_spot::domain::indicators::{
     B2_01_BARS_PER_DAY, B2_01_LOOKBACKS, B2_01_N_EFF, SIGMA_BAR_FLOOR,
 };
 use vortex_m2b_spot::domain::strategy::{
-    aggregate_1h_to_4h, compute_b2_01_signals, filter_strictly_closed_1h, is_4h_utc_close,
-    plan_rebalance_orders, RebalancePlanInput,
+    aggregate_1h_to_4h, compute_b2_01_signals, compute_vol_targeted_weights,
+    filter_strictly_closed_1h, is_4h_utc_close, plan_rebalance_orders, RebalancePlanInput, L_MAX,
+    MIN_CLOSED_1H_CANDLES, SIGMA_TARGET, VOL_FLOOR_ANN, W_MAX,
 };
 use vortex_m2b_spot::domain::types::{
-    Candle, DomainEvent, InstrumentRules, Money1e8, OrderSide, PositionState, Price1e8, Qty1e8,
-    Symbol, FOUR_HOURS_MS, ONE_HOUR_MS, SCALE_1E8, UNIVERSE_LEN,
+    make_order_link_id, AssetSymbol, Candle, DomainEvent, InstrumentRules, Money1e8, OrderSide,
+    PositionState, Price1e8, Qty1e8, SymbolId, Universe, FOUR_HOURS_MS, MAX_UNIVERSE_ASSETS,
+    ONE_HOUR_MS, SCALE_1E8,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -35,9 +37,9 @@ fn mk_candle(
     }
 }
 
-fn mk_rule(symbol: Symbol, base_step: i128, min_qty: i128, min_amt: i128) -> InstrumentRules {
+fn mk_rule(symbol: &AssetSymbol, base_step: i128, min_qty: i128, min_amt: i128) -> InstrumentRules {
     InstrumentRules {
-        symbol,
+        symbol: symbol.clone(),
         base_precision: Qty1e8(base_step),
         quote_precision: Money1e8(1_000_000),
         min_order_qty: Qty1e8(min_qty),
@@ -47,8 +49,12 @@ fn mk_rule(symbol: Symbol, base_step: i128, min_qty: i128, min_amt: i128) -> Ins
     }
 }
 
-fn default_rules() -> [InstrumentRules; UNIVERSE_LEN] {
-    Symbol::ALL.map(|sym| mk_rule(sym, 1_000_000, 1_000_000, 500_000_000))
+fn default_rules(universe: &Universe) -> Vec<InstrumentRules> {
+    universe
+        .symbols()
+        .iter()
+        .map(|sym| mk_rule(sym, 1_000_000, 1_000_000, 500_000_000))
+        .collect()
 }
 
 fn build_synthetic_1h_series(len: usize, seed_offset: f64) -> Vec<Candle> {
@@ -319,22 +325,25 @@ fn tsmom_1h_72_168_504_closed_form_and_1h_to_4h_aggregator() -> TestResult {
 #[test]
 fn zero_lookahead_b2_01_bit_identical_after_future_perturbation() -> TestResult {
     let cutoff = 580usize;
-    let base_universe: [Vec<Candle>; UNIVERSE_LEN] = [
+    let base_universe = [
         build_synthetic_1h_series(610, 0.1),
         build_synthetic_1h_series(610, 0.5),
         build_synthetic_1h_series(610, 1.1),
         build_synthetic_1h_series(610, 1.7),
         build_synthetic_1h_series(610, 2.3),
+        build_synthetic_1h_series(610, 2.9),
     ];
 
     // Baseline: signals computed on prefix 0..=cutoff (581 bars)
-    let prefix_universe: [Vec<Candle>; UNIVERSE_LEN] =
-        std::array::from_fn(|i| base_universe[i][..=cutoff].to_vec());
+    let prefix_universe: Vec<Vec<Candle>> = base_universe
+        .iter()
+        .map(|series| series[..=cutoff].to_vec())
+        .collect();
     let base_sig = compute_b2_01_signals(&prefix_universe)?;
 
     // Perturbed: wildly mutate bars after cutoff AND append 40 future bars beyond 610
     let server_time_at_cutoff = base_universe[0][cutoff].open_ts_ms + ONE_HOUR_MS;
-    let mut perturbed_filtered: Vec<Vec<Candle>> = Vec::with_capacity(UNIVERSE_LEN);
+    let mut perturbed_filtered: Vec<Vec<Candle>> = Vec::with_capacity(base_universe.len());
     for (sym_idx, sym_series) in base_universe.iter().enumerate() {
         let mut s = sym_series.clone();
         for (j, bar) in s.iter_mut().enumerate().skip(cutoff + 1) {
@@ -389,19 +398,15 @@ fn zero_lookahead_b2_01_bit_identical_after_future_perturbation() -> TestResult 
             );
         }
 
-        // Also test strict close filter + B2-01 signal pipeline at cutoff close
         let closed = filter_strictly_closed_1h(&s, server_time_at_cutoff)?;
         perturbed_filtered.push(closed);
     }
 
-    let perturbed_arr: [Vec<Candle>; UNIVERSE_LEN] = perturbed_filtered
-        .try_into()
-        .map_err(|_| "expected 5 series")?;
-    let pert_sig = compute_b2_01_signals(&perturbed_arr)?;
+    let pert_sig = compute_b2_01_signals(&perturbed_filtered)?;
 
     assert_eq!(base_sig.last_open_ts_ms, pert_sig.last_open_ts_ms);
     assert_eq!(base_sig.last_close_ts_ms, pert_sig.last_close_ts_ms);
-    for i in 0..UNIVERSE_LEN {
+    for i in 0..base_universe.len() {
         assert_eq!(
             base_sig.sigma_bar[i].to_bits(),
             pert_sig.sigma_bar[i].to_bits()
@@ -426,13 +431,15 @@ fn zero_lookahead_b2_01_bit_identical_after_future_perturbation() -> TestResult 
 
 #[test]
 fn spot_v5_asymmetric_fee_accounting_and_zero_drift() -> TestResult {
-    let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000))?; // 1000.00 USDT
-    let prices_buy = [Price1e8(10_000_000_000); UNIVERSE_LEN]; // 100.00 USDT
+    let n = 6usize;
+    let btc_id = SymbolId(0);
+    let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000), n)?; // 1000.00 USDT
+    let prices_buy = vec![Price1e8(10_000_000_000); n]; // 100.00 USDT
 
     // Buy 500.00 USDT -> gross 5.00000000 BTC, fee_base = 0.00500000 BTC,
     // base_precision = 0.01 -> (5.000 - 0.005) = 4.995 floored to 0.01 => 4.99 BTC!
     ledger.apply_buy_fill(
-        Symbol::BtcUsdt,
+        btc_id,
         Money1e8(50_000_000_000),
         Qty1e8(500_000_000),
         Qty1e8(500_000),
@@ -440,12 +447,9 @@ fn spot_v5_asymmetric_fee_accounting_and_zero_drift() -> TestResult {
     )?;
 
     assert_eq!(ledger.cash_1e8(), Money1e8(50_000_000_000));
+    assert_eq!(ledger.position(btc_id)?.qty_1e8, Qty1e8(499_000_000));
     assert_eq!(
-        ledger.position(Symbol::BtcUsdt).qty_1e8,
-        Qty1e8(499_000_000)
-    );
-    assert_eq!(
-        ledger.position(Symbol::BtcUsdt).cost_basis_usdt_1e8,
+        ledger.position(btc_id)?.cost_basis_usdt_1e8,
         Money1e8(50_000_000_000)
     );
     assert_eq!(ledger.cum_buy_fees_usdt_est_1e8(), Money1e8(50_000_000));
@@ -453,11 +457,12 @@ fn spot_v5_asymmetric_fee_accounting_and_zero_drift() -> TestResult {
     assert_eq!(ledger.drift_mtm_1e8(&prices_buy)?, 0);
 
     // Partial sell 2.00 BTC at 120.00 USDT -> gross 240.00 USDT, fee 0.24 USDT in USDT
-    let mut prices_sell = [Price1e8(10_000_000_000); UNIVERSE_LEN];
-    prices_sell[Symbol::BtcUsdt.index()] = Price1e8(12_000_000_000);
+    let mut prices_sell = vec![Price1e8(10_000_000_000); n];
+    prices_sell[btc_id.index()] = Price1e8(12_000_000_000);
 
     ledger.apply_sell_fill(
-        Symbol::BtcUsdt,
+        btc_id,
+        "BTCUSDT",
         Qty1e8(200_000_000),
         Money1e8(24_000_000_000),
         Money1e8(24_000_000),
@@ -472,12 +477,9 @@ fn spot_v5_asymmetric_fee_accounting_and_zero_drift() -> TestResult {
         ledger.cash_1e8(),
         Money1e8(50_000_000_000 + 24_000_000_000 - 24_000_000)
     );
+    assert_eq!(ledger.position(btc_id)?.qty_1e8, Qty1e8(299_000_000));
     assert_eq!(
-        ledger.position(Symbol::BtcUsdt).qty_1e8,
-        Qty1e8(299_000_000)
-    );
-    assert_eq!(
-        ledger.position(Symbol::BtcUsdt).cost_basis_usdt_1e8,
+        ledger.position(btc_id)?.cost_basis_usdt_1e8,
         Money1e8(50_000_000_000 - expected_released_cost)
     );
     assert_eq!(
@@ -494,25 +496,29 @@ fn spot_v5_asymmetric_fee_accounting_and_zero_drift() -> TestResult {
 
 #[test]
 fn strict_sell_first_buy_second_with_zero_initial_cash_and_reserve() -> TestResult {
-    let rules = default_rules();
-    let prices = [
-        Price1e8(10_000_000_000), // BTC = $100
-        Price1e8(10_000_000_000), // ETH = $100
-        Price1e8(10_000_000_000), // SOL = $100
-        Price1e8(10_000_000_000), // LINK = $100
-        Price1e8(2_000_000_000),  // AVAX = $20
+    let universe = Universe::default_universe()?;
+    let n = universe.len();
+    let rules = default_rules(&universe);
+    let prices = vec![
+        Price1e8(10_000_000_000),  // BTC = $100
+        Price1e8(10_000_000_000),  // ETH = $100
+        Price1e8(10_000_000_000),  // SOL = $100
+        Price1e8(10_000_000_000),  // LINK = $100
+        Price1e8(2_000_000_000),   // AVAX = $20
+        Price1e8(250_000_000_000), // XAUT = $2500
     ];
 
-    // Start with $0 cash and 20.0 AVAX ($400) at index 4; targets are BTC (idx 0) and ETH (idx 1)
-    let mut positions = [PositionState::default(); UNIVERSE_LEN];
-    positions[Symbol::AvaxUsdt.index()] = PositionState {
+    // Start with $0 cash and 20.0 AVAX ($400) at index 4; targets are BTC (idx 0), ETH (idx 1), SOL (idx 2)
+    let mut positions = vec![PositionState::default(); n];
+    positions[4] = PositionState {
         qty_1e8: Qty1e8(2_000_000_000),
         cost_basis_usdt_1e8: Money1e8(40_000_000_000),
     };
-    let current_weights = [0.0, 0.0, 0.0, 0.0, 1.0];
-    let target_weights = [0.40, 0.40, 0.20, 0.0, 0.0];
+    let current_weights = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    let target_weights = [0.40, 0.40, 0.20, 0.0, 0.0, 0.0];
 
     let orders = plan_rebalance_orders(&RebalancePlanInput {
+        universe: &universe,
         cash_1e8: Money1e8::ZERO,
         positions: &positions,
         prices_1e8: &prices,
@@ -525,7 +531,7 @@ fn strict_sell_first_buy_second_with_zero_initial_cash_and_reserve() -> TestResu
 
     assert_eq!(orders.len(), 4);
     assert_eq!(orders[0].side, OrderSide::Sell);
-    assert_eq!(orders[0].symbol, Symbol::AvaxUsdt);
+    assert_eq!(orders[0].symbol.as_str(), "AVAXUSDT");
     assert!(orders[0].full_liquidation);
 
     // Every Buy must appear strictly after all Sells
@@ -541,20 +547,17 @@ fn strict_sell_first_buy_second_with_zero_initial_cash_and_reserve() -> TestResu
         .all(|o| o.side == OrderSide::Buy));
 
     // Closed-form projected post-sell cash minus 0.3% (30 bps) reserve:
-    // sell_gross = $400 = 40_000_000_000; sell_fee = 0.001 * 400 = $0.40 = 40_000_000;
-    // net_cash = 39_960_000_000; budget = floor(39_960_000_000 * 9970 / 10000) = 39_840_120_000.
-    // Total desired buy = $160 + $160 + $80 = $400 = 40_000_000_000 > budget => scaled proportionally!
     let expected_budget = 39_840_120_000i128;
     let total_desired = 40_000_000_000i128;
     let exp_btc = (16_000_000_000i128 * expected_budget) / total_desired;
     let exp_eth = (16_000_000_000i128 * expected_budget) / total_desired;
     let exp_sol = (8_000_000_000i128 * expected_budget) / total_desired;
 
-    assert_eq!(orders[1].symbol, Symbol::BtcUsdt);
+    assert_eq!(orders[1].symbol.as_str(), "BTCUSDT");
     assert_eq!(orders[1].quote_spend_1e8, Money1e8(exp_btc));
-    assert_eq!(orders[2].symbol, Symbol::EthUsdt);
+    assert_eq!(orders[2].symbol.as_str(), "ETHUSDT");
     assert_eq!(orders[2].quote_spend_1e8, Money1e8(exp_eth));
-    assert_eq!(orders[3].symbol, Symbol::SolUsdt);
+    assert_eq!(orders[3].symbol.as_str(), "SOLUSDT");
     assert_eq!(orders[3].quote_spend_1e8, Money1e8(exp_sol));
 
     let total_buy_spend: i128 = orders[1..].iter().map(|o| o.quote_spend_1e8.raw()).sum();
@@ -565,11 +568,13 @@ fn strict_sell_first_buy_second_with_zero_initial_cash_and_reserve() -> TestResu
 
 #[test]
 fn external_deposit_plus_50_usdt_is_neutral_to_twr_and_trading_pnl() -> TestResult {
-    let mut ledger = SpotPortfolioLedger::new(Money1e8(10_000_000_000))?; // $100.00
-    let p_entry = [Price1e8(5_000_000_000); UNIVERSE_LEN]; // $50.00
+    let n = 6usize;
+    let eth_id = SymbolId(1);
+    let mut ledger = SpotPortfolioLedger::new(Money1e8(10_000_000_000), n)?; // $100.00
+    let p_entry = vec![Price1e8(5_000_000_000); n]; // $50.00
 
     ledger.apply_buy_fill(
-        Symbol::EthUsdt,
+        eth_id,
         Money1e8(6_000_000_000), // $60.00
         Qty1e8(120_000_000),     // 1.20 ETH
         Qty1e8(120_000),         // 0.0012 ETH fee
@@ -578,18 +583,19 @@ fn external_deposit_plus_50_usdt_is_neutral_to_twr_and_trading_pnl() -> TestResu
     ledger.assert_zero_drift(&p_entry)?;
 
     // Mark at +25% ($62.50) and realize partial gain
-    let p_up = [Price1e8(6_250_000_000); UNIVERSE_LEN];
+    let p_up = vec![Price1e8(6_250_000_000); n];
     assert!(ledger.mark_to_market(&p_up)?.is_none());
 
     ledger.apply_sell_fill(
-        Symbol::EthUsdt,
+        eth_id,
+        "ETHUSDT",
         Qty1e8(50_000_000),      // 0.50 ETH
         Money1e8(3_125_000_000), // $31.25
         Money1e8(3_125_000),     // $0.03125 fee
     )?;
 
     // Mark at $65.00 before external deposit
-    let p_mark = [Price1e8(6_500_000_000); UNIVERSE_LEN];
+    let p_mark = vec![Price1e8(6_500_000_000); n];
     assert!(ledger.mark_to_market(&p_mark)?.is_none());
 
     let twr_before = ledger.twr_index_1e10();
@@ -626,22 +632,25 @@ fn external_deposit_plus_50_usdt_is_neutral_to_twr_and_trading_pnl() -> TestResu
 
 #[test]
 fn anti_dust_escalation_and_below_5_usdt_buy_skipped() -> TestResult {
-    let rules = default_rules();
-    let prices = [Price1e8(10_000_000_000); UNIVERSE_LEN]; // $100
+    let universe = Universe::default_universe()?;
+    let n = universe.len();
+    let rules = default_rules(&universe);
+    let prices = vec![Price1e8(10_000_000_000); n]; // $100
 
     // Case 1: Anti-dust sell escalation (1.04 ETH = $104, target 0.03 = $3.12 remainder < $5)
-    let mut pos_dust = [PositionState::default(); UNIVERSE_LEN];
-    pos_dust[Symbol::EthUsdt.index()] = PositionState {
+    let mut pos_dust = vec![PositionState::default(); n];
+    pos_dust[1] = PositionState {
         qty_1e8: Qty1e8(104_000_000),
         cost_basis_usdt_1e8: Money1e8(10_400_000_000),
     };
     let orders_dust = plan_rebalance_orders(&RebalancePlanInput {
+        universe: &universe,
         cash_1e8: Money1e8::ZERO,
         positions: &pos_dust,
         prices_1e8: &prices,
         rules: &rules,
-        target_weights: &[0.0, 0.03, 0.0, 0.0, 0.0],
-        current_weights: &[0.0, 1.0, 0.0, 0.0, 0.0],
+        target_weights: &[0.0, 0.03, 0.0, 0.0, 0.0, 0.0],
+        current_weights: &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
         fee_rate: DEFAULT_SPOT_FEE_RATE,
         allow_buys: true,
     })?;
@@ -651,16 +660,15 @@ fn anti_dust_escalation_and_below_5_usdt_buy_skipped() -> TestResult {
     assert_eq!(orders_dust[0].base_qty_1e8, Qty1e8(104_000_000));
 
     // Case 2: < $5 buy skipped cleanly
-    // Equity = $50.00 cash, target weight = 0.09 (>= DEADBAND 0.08 so rebalance triggers)
-    // Desired buy = $50.00 * 0.09 = $4.50 < $5.00 min_order_amt => cleanly skipped (0 orders).
-    let pos_empty = [PositionState::default(); UNIVERSE_LEN];
+    let pos_empty = vec![PositionState::default(); n];
     let orders_small_buy = plan_rebalance_orders(&RebalancePlanInput {
+        universe: &universe,
         cash_1e8: Money1e8(5_000_000_000), // $50.00
         positions: &pos_empty,
         prices_1e8: &prices,
         rules: &rules,
-        target_weights: &[0.09, 0.0, 0.0, 0.0, 0.0],
-        current_weights: &[0.0, 0.0, 0.0, 0.0, 0.0],
+        target_weights: &[0.09, 0.0, 0.0, 0.0, 0.0, 0.0],
+        current_weights: &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         fee_rate: DEFAULT_SPOT_FEE_RATE,
         allow_buys: true,
     })?;
@@ -671,9 +679,11 @@ fn anti_dust_escalation_and_below_5_usdt_buy_skipped() -> TestResult {
 
 #[test]
 fn hard_drawdown_halt_strictly_above_25_percent() -> TestResult {
-    let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000))?; // $1000
+    let n = 6usize;
+    let sol_id = SymbolId(2);
+    let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000), n)?; // $1000
     ledger.apply_buy_fill(
-        Symbol::SolUsdt,
+        sol_id,
         Money1e8(100_000_000_000),
         Qty1e8(1_000_000_000), // 10 SOL @ $100
         Qty1e8::ZERO,
@@ -681,12 +691,12 @@ fn hard_drawdown_halt_strictly_above_25_percent() -> TestResult {
     )?;
 
     // Exactly 25.00% drawdown -> must NOT halt
-    let p_25 = [Price1e8(7_500_000_000); UNIVERSE_LEN];
+    let p_25 = vec![Price1e8(7_500_000_000); n];
     assert!(ledger.mark_to_market(&p_25)?.is_none());
     assert!(!ledger.is_halted());
 
     // 25.01% drawdown ($74.99 * 10 = $749.90) -> must emit HardDrawdownHalt and halt
-    let p_over_25 = [Price1e8(7_499_000_000); UNIVERSE_LEN];
+    let p_over_25 = vec![Price1e8(7_499_000_000); n];
     let ev = ledger.mark_to_market(&p_over_25)?;
     assert!(matches!(
         ev,
@@ -698,7 +708,194 @@ fn hard_drawdown_halt_strictly_above_25_percent() -> TestResult {
     // Verify zero drift even when halted
     assert_eq!(ledger.drift_book_1e8()?, 0);
     assert_eq!(ledger.drift_mtm_1e8(&p_over_25)?, 0);
-    let _ = SCALE_1E8; // reference domain constant cleanly
+    let _ = SCALE_1E8;
+
+    Ok(())
+}
+
+#[test]
+fn xaut_low_volatility_regime_floor_wmax_and_lmax_rescaling_closed_form() -> TestResult {
+    // Verify frozen constants: SIGMA_TARGET/4 = 0.125, VOL_FLOOR_ANN = 0.15, W_MAX = 0.40, L_MAX = 1.00
+    assert!((SIGMA_TARGET / 4.0 - 0.125).abs() < 1e-15);
+    assert!((VOL_FLOOR_ANN - 0.15).abs() < 1e-15);
+
+    // 1) Low-volatility regime XAUTUSDT (sigma_ann = 12% < 15% floor), fixed 0.125 numerator (NOT / N)
+    let sigma_12 = [0.25, 0.30, 0.35, 0.40, 0.25, 0.12];
+    let tsmom_unclamped = [0.0, 0.0, 0.0, 0.0, 0.0, 0.30];
+    let (raw_a, w_a) = compute_vol_targeted_weights(&sigma_12, &tsmom_unclamped)?;
+    // (0.125 / max(0.12, 0.15)) * 0.30 = (0.125 / 0.15) * 0.30 = 0.25
+    assert!((raw_a[5] - 0.25).abs() < 1e-13);
+    assert!((w_a[5] - 0.25).abs() < 1e-13);
+
+    // 2) Low-volatility regime XAUTUSDT (sigma_ann = 12%), high signal -> clamped to W_MAX = 0.40
+    let tsmom_capped = [0.0, 0.0, 0.0, 0.0, 0.0, 0.72];
+    let (raw_b, w_b) = compute_vol_targeted_weights(&sigma_12, &tsmom_capped)?;
+    assert!((raw_b[5] - W_MAX).abs() < 1e-13);
+    assert!((w_b[5] - W_MAX).abs() < 1e-13);
+
+    // 3) Median XAUTUSDT volatility regime (sigma_ann = 19.4% > 15% floor)
+    let sigma_194 = [0.50, 0.50, 0.50, 0.50, 0.50, 0.194];
+    let tsmom_194_unclamped = [0.0, 0.0, 0.0, 0.0, 0.0, 0.40];
+    let (raw_c, w_c) = compute_vol_targeted_weights(&sigma_194, &tsmom_194_unclamped)?;
+    let expected_194 = (0.125 / 0.194) * 0.40;
+    assert!((raw_c[5] - expected_194).abs() < 1e-13);
+    assert!((w_c[5] - expected_194).abs() < 1e-13);
+
+    let tsmom_194_capped = [0.0, 0.0, 0.0, 0.0, 0.0, 0.80];
+    let (raw_d, w_d) = compute_vol_targeted_weights(&sigma_194, &tsmom_194_capped)?;
+    assert!((raw_d[5] - W_MAX).abs() < 1e-13);
+    assert!((w_d[5] - W_MAX).abs() < 1e-13);
+
+    // 4) 6-pair (5P + XAUTUSDT) proportional rescaling when sum(raw) > L_MAX = 1.00
+    let sigma_all = [0.25, 0.30, 0.40, 0.50, 0.25, 0.12];
+    let tsmom_all = [0.90, 0.80, 0.80, 0.90, 0.60, 0.72];
+    let (raw_all, w_all) = compute_vol_targeted_weights(&sigma_all, &tsmom_all)?;
+
+    let expected_raw = [
+        0.40,                  // (0.125/0.25)*0.90 = 0.45 -> W_MAX
+        (0.125 / 0.30) * 0.80, // 0.3333333333333333
+        0.25,                  // (0.125/0.40)*0.80
+        0.225,                 // (0.125/0.50)*0.90
+        0.30,                  // (0.125/0.25)*0.60
+        0.40,                  // (0.125/0.15)*0.72 = 0.60 -> W_MAX
+    ];
+    let expected_sum: f64 = expected_raw.iter().sum();
+    let expected_scale = L_MAX / expected_sum;
+    for i in 0..6 {
+        assert!((raw_all[i] - expected_raw[i]).abs() < 1e-13);
+        assert!((w_all[i] - expected_raw[i] * expected_scale).abs() < 1e-13);
+    }
+    let total_w: f64 = w_all.iter().sum();
+    assert!((total_w - L_MAX).abs() < 1e-12);
+
+    Ok(())
+}
+
+#[test]
+fn universe_validation_fail_closed_and_variable_n_accounting() -> TestResult {
+    // 1) Default 6-pair universe & base_coin extraction (XAUTUSDT -> XAUT)
+    let default_u = Universe::default_universe()?;
+    assert_eq!(default_u.len(), 6);
+    assert_eq!(
+        default_u.as_strings(),
+        vec!["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT", "XAUTUSDT"]
+    );
+    let xaut = default_u
+        .get(SymbolId(5))
+        .ok_or("missing index 5 XAUTUSDT")?;
+    assert_eq!(xaut.as_str(), "XAUTUSDT");
+    assert_eq!(xaut.base_coin(), "XAUT");
+
+    // 2) Fail-Closed rejections for invalid universes & symbols
+    assert!(matches!(
+        Universe::new(Vec::new()),
+        Err(DomainError::InvalidUniverse(_))
+    ));
+    for bad_csv in [
+        "",
+        "   ",
+        "BTCUSDT,",
+        ",BTCUSDT",
+        "BTCUSDT,,ETHUSDT",
+        "BTCUSDT,BTCUSDT",
+        "BTCUSDT,btcusdt",
+        "USDT",
+        "BTCUSDC",
+        "XAUTUSD",
+        "ETHBTC",
+        "AUSDT",                 // len 5 < 6
+        "ABCDEFGHIJKLMNOPQUSDT", // len 21 > 20
+        "BTC-USDT",
+        "BTC_USDT",
+    ] {
+        assert!(
+            matches!(
+                Universe::parse_csv(bad_csv),
+                Err(DomainError::InvalidUniverse(_))
+            ),
+            "expected InvalidUniverse for '{bad_csv}'"
+        );
+    }
+
+    // Strict constructor rejects lowercase
+    assert!(matches!(
+        AssetSymbol::new("xautusdt"),
+        Err(DomainError::InvalidUniverse(_))
+    ));
+
+    // > 20 assets rejected fail-closed
+    let twenty_one: Vec<String> = (1..=21).map(|i| format!("AST{i:02}USDT")).collect();
+    assert!(matches!(
+        Universe::from_strict_strs(&twenty_one),
+        Err(DomainError::InvalidUniverse(_))
+    ));
+
+    // 3) Variable N = 1, 6, 20 signals + Drift == 0 accounting + orderLinkId <= 36 chars
+    let mut base_1h = Vec::with_capacity(MIN_CLOSED_1H_CANDLES);
+    for k in 0..MIN_CLOSED_1H_CANDLES {
+        let p = 100.0 + (k as f64) * 0.05;
+        base_1h.push(mk_candle(
+            (k as i64) * ONE_HOUR_MS,
+            p,
+            p + 1.0,
+            p - 0.5,
+            p + 0.2,
+            10.0,
+            10.0 * p,
+        ));
+    }
+
+    for n in [1usize, 6usize, MAX_UNIVERSE_ASSETS] {
+        let sym_strs: Vec<String> = (0..n)
+            .map(|i| {
+                if n == 20 && i == 19 {
+                    "VERYLONGASSET123USDT".to_string() // 20 chars max bound
+                } else {
+                    format!("COIN{i:02}USDT")
+                }
+            })
+            .collect();
+        let u = Universe::from_strict_strs(&sym_strs)?;
+        assert_eq!(u.len(), n);
+
+        let series = vec![base_1h.clone(); n];
+        let sig = compute_b2_01_signals(&series)?;
+        assert_eq!(sig.target_weights.len(), n);
+        assert!(sig.target_weights.iter().sum::<f64>() <= L_MAX + 1e-12);
+
+        let rules = default_rules(&u);
+        let prices = vec![Price1e8(10_000_000_000); n];
+        let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000), n)?;
+        let current_w = ledger.current_weights(&prices)?;
+        let planned = plan_rebalance_orders(&RebalancePlanInput {
+            universe: &u,
+            cash_1e8: ledger.cash_1e8(),
+            positions: ledger.positions(),
+            prices_1e8: &prices,
+            rules: &rules,
+            target_weights: &sig.target_weights,
+            current_weights: &current_w,
+            fee_rate: DEFAULT_SPOT_FEE_RATE,
+            allow_buys: true,
+        })?;
+        for ord in &planned {
+            let link_id = make_order_link_id(1_728_000_000_000, &ord.symbol, ord.side);
+            assert!(
+                link_id.len() <= 36,
+                "orderLinkId '{}' exceeds 36 chars",
+                link_id
+            );
+            ledger.apply_buy_fill(
+                ord.symbol_id,
+                ord.quote_spend_1e8,
+                ord.base_qty_1e8,
+                Qty1e8::ZERO,
+                rules[ord.symbol_id.index()].base_precision,
+            )?;
+        }
+        assert_eq!(ledger.drift_book_1e8()?, 0);
+        assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+    }
 
     Ok(())
 }

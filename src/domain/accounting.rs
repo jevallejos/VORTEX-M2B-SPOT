@@ -1,7 +1,8 @@
 use crate::domain::error::DomainError;
 use crate::domain::types::{
     mul_div_floor_nonneg, mul_div_round, DomainEvent, Money1e8, PortfolioSnapshot, PositionState,
-    Price1e8, Qty1e8, Rate1e10, Symbol, RATE_SCALE_1E10, SCALE_1E8, UNIVERSE_LEN,
+    Price1e8, Qty1e8, Rate1e10, SymbolId, MAX_UNIVERSE_ASSETS, MIN_UNIVERSE_ASSETS,
+    RATE_SCALE_1E10, SCALE_1E8,
 };
 
 pub const MAX_HARD_DD_RATE_1E10: i128 = 2_500_000_000; // 25%
@@ -9,12 +10,13 @@ pub const DEFAULT_SPOT_FEE_RATE: Rate1e10 = Rate1e10::from_bps(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpotPortfolioLedger {
+    num_assets: usize,
     cash_1e8: Money1e8,
-    positions: [PositionState; UNIVERSE_LEN],
+    positions: Vec<PositionState>,
     total_deposits_1e8: Money1e8,
     realized_pnl_gross_1e8: Money1e8,
     cum_sell_fees_usdt_1e8: Money1e8,
-    cum_buy_fees_base_1e8: [Qty1e8; UNIVERSE_LEN],
+    cum_buy_fees_base_1e8: Vec<Qty1e8>,
     cum_buy_fees_usdt_est_1e8: Money1e8,
     twr_index_1e10: Rate1e10,
     twr_peak_1e10: Rate1e10,
@@ -23,18 +25,24 @@ pub struct SpotPortfolioLedger {
 }
 
 impl SpotPortfolioLedger {
-    pub fn new(initial_cash_1e8: Money1e8) -> Result<Self, DomainError> {
+    pub fn new(initial_cash_1e8: Money1e8, num_assets: usize) -> Result<Self, DomainError> {
+        if !(MIN_UNIVERSE_ASSETS..=MAX_UNIVERSE_ASSETS).contains(&num_assets) {
+            return Err(DomainError::InvalidUniverse(format!(
+                "ledger num_assets {num_assets} out of bounds ({MIN_UNIVERSE_ASSETS}..={MAX_UNIVERSE_ASSETS})"
+            )));
+        }
         if initial_cash_1e8.0 < 0 {
             return Err(DomainError::NegativeValueNotAllowed("initial_cash_1e8"));
         }
 
         Ok(Self {
+            num_assets,
             cash_1e8: initial_cash_1e8,
-            positions: [PositionState::default(); UNIVERSE_LEN],
+            positions: vec![PositionState::default(); num_assets],
             total_deposits_1e8: initial_cash_1e8,
             realized_pnl_gross_1e8: Money1e8::ZERO,
             cum_sell_fees_usdt_1e8: Money1e8::ZERO,
-            cum_buy_fees_base_1e8: [Qty1e8::ZERO; UNIVERSE_LEN],
+            cum_buy_fees_base_1e8: vec![Qty1e8::ZERO; num_assets],
             cum_buy_fees_usdt_est_1e8: Money1e8::ZERO,
             twr_index_1e10: Rate1e10::ONE,
             twr_peak_1e10: Rate1e10::ONE,
@@ -43,7 +51,29 @@ impl SpotPortfolioLedger {
         })
     }
 
-    pub fn from_snapshot(snap: PortfolioSnapshot) -> Result<Self, DomainError> {
+    pub fn from_snapshot(
+        snap: PortfolioSnapshot,
+        expected_num_assets: usize,
+    ) -> Result<Self, DomainError> {
+        if !(MIN_UNIVERSE_ASSETS..=MAX_UNIVERSE_ASSETS).contains(&expected_num_assets) {
+            return Err(DomainError::InvalidUniverse(format!(
+                "expected_num_assets {expected_num_assets} out of bounds ({MIN_UNIVERSE_ASSETS}..={MAX_UNIVERSE_ASSETS})"
+            )));
+        }
+        if snap.positions.len() != expected_num_assets {
+            return Err(DomainError::CorruptStateLength {
+                field: "portfolio.positions",
+                expected: expected_num_assets,
+                actual: snap.positions.len(),
+            });
+        }
+        if snap.cum_buy_fees_base_1e8.len() != expected_num_assets {
+            return Err(DomainError::CorruptStateLength {
+                field: "portfolio.cum_buy_fees_base_1e8",
+                expected: expected_num_assets,
+                actual: snap.cum_buy_fees_base_1e8.len(),
+            });
+        }
         if snap.cash_1e8.0 < 0 {
             return Err(DomainError::NegativeValueNotAllowed("cash_1e8"));
         }
@@ -71,7 +101,7 @@ impl SpotPortfolioLedger {
             ));
         }
 
-        for i in 0..UNIVERSE_LEN {
+        for i in 0..expected_num_assets {
             if snap.positions[i].qty_1e8.0 < 0 {
                 return Err(DomainError::NegativeValueNotAllowed("position qty_1e8"));
             }
@@ -88,6 +118,7 @@ impl SpotPortfolioLedger {
         }
 
         let ledger = Self {
+            num_assets: expected_num_assets,
             cash_1e8: snap.cash_1e8,
             positions: snap.positions,
             total_deposits_1e8: snap.total_deposits_1e8,
@@ -107,11 +138,11 @@ impl SpotPortfolioLedger {
     pub fn snapshot(&self) -> PortfolioSnapshot {
         PortfolioSnapshot {
             cash_1e8: self.cash_1e8,
-            positions: self.positions,
+            positions: self.positions.clone(),
             total_deposits_1e8: self.total_deposits_1e8,
             realized_pnl_gross_1e8: self.realized_pnl_gross_1e8,
             cum_sell_fees_usdt_1e8: self.cum_sell_fees_usdt_1e8,
-            cum_buy_fees_base_1e8: self.cum_buy_fees_base_1e8,
+            cum_buy_fees_base_1e8: self.cum_buy_fees_base_1e8.clone(),
             cum_buy_fees_usdt_est_1e8: self.cum_buy_fees_usdt_est_1e8,
             twr_index_1e10: self.twr_index_1e10,
             twr_peak_1e10: self.twr_peak_1e10,
@@ -121,18 +152,31 @@ impl SpotPortfolioLedger {
     }
 
     #[inline]
+    pub const fn num_assets(&self) -> usize {
+        self.num_assets
+    }
+
+    #[inline]
     pub const fn cash_1e8(&self) -> Money1e8 {
         self.cash_1e8
     }
 
     #[inline]
-    pub const fn position(&self, symbol: Symbol) -> PositionState {
-        self.positions[symbol.index()]
+    pub fn position(&self, id: SymbolId) -> Result<PositionState, DomainError> {
+        self.positions
+            .get(id.index())
+            .copied()
+            .ok_or(DomainError::InvalidParameter("symbol_id out of bounds"))
     }
 
     #[inline]
-    pub const fn positions(&self) -> &[PositionState; UNIVERSE_LEN] {
+    pub fn positions(&self) -> &[PositionState] {
         &self.positions
+    }
+
+    #[inline]
+    pub fn cum_buy_fees_base_1e8(&self) -> &[Qty1e8] {
+        &self.cum_buy_fees_base_1e8
     }
 
     #[inline]
@@ -184,30 +228,31 @@ impl SpotPortfolioLedger {
         self.halted = halted;
     }
 
-    fn position_mtm_values_1e8(
-        &self,
-        prices: &[Price1e8; UNIVERSE_LEN],
-    ) -> Result<[i128; UNIVERSE_LEN], DomainError> {
-        let mut vals = [0i128; UNIVERSE_LEN];
-        for i in 0..UNIVERSE_LEN {
-            let p = prices[i].0;
+    fn position_mtm_values_1e8(&self, prices: &[Price1e8]) -> Result<Vec<i128>, DomainError> {
+        if prices.len() != self.num_assets {
+            return Err(DomainError::CorruptStateLength {
+                field: "prices_1e8",
+                expected: self.num_assets,
+                actual: prices.len(),
+            });
+        }
+        let mut vals = Vec::with_capacity(self.num_assets);
+        for (pos, price) in self.positions.iter().zip(prices.iter()) {
+            let p = price.0;
             if p < 0 {
                 return Err(DomainError::NegativeValueNotAllowed("price_1e8"));
             }
-            if self.positions[i].qty_1e8.0 > 0 && p == 0 {
+            if pos.qty_1e8.0 > 0 && p == 0 {
                 return Err(DomainError::InvalidParameter(
                     "price must be positive for open position",
                 ));
             }
-            vals[i] = mul_div_floor_nonneg(self.positions[i].qty_1e8.0, p, SCALE_1E8)?;
+            vals.push(mul_div_floor_nonneg(pos.qty_1e8.0, p, SCALE_1E8)?);
         }
         Ok(vals)
     }
 
-    pub fn unrealized_pnl_1e8(
-        &self,
-        prices: &[Price1e8; UNIVERSE_LEN],
-    ) -> Result<Money1e8, DomainError> {
+    pub fn unrealized_pnl_1e8(&self, prices: &[Price1e8]) -> Result<Money1e8, DomainError> {
         let vals = self.position_mtm_values_1e8(prices)?;
         let mut sum = 0i128;
         for (val, pos) in vals.iter().zip(self.positions.iter()) {
@@ -221,7 +266,7 @@ impl SpotPortfolioLedger {
         Ok(Money1e8(sum))
     }
 
-    pub fn equity_1e8(&self, prices: &[Price1e8; UNIVERSE_LEN]) -> Result<Money1e8, DomainError> {
+    pub fn equity_1e8(&self, prices: &[Price1e8]) -> Result<Money1e8, DomainError> {
         let vals = self.position_mtm_values_1e8(prices)?;
         let mut sum = self.cash_1e8.0;
         for v in vals {
@@ -230,26 +275,23 @@ impl SpotPortfolioLedger {
         Ok(Money1e8(sum))
     }
 
-    pub fn current_weights(
-        &self,
-        prices: &[Price1e8; UNIVERSE_LEN],
-    ) -> Result<[f64; UNIVERSE_LEN], DomainError> {
+    pub fn current_weights(&self, prices: &[Price1e8]) -> Result<Vec<f64>, DomainError> {
         let vals = self.position_mtm_values_1e8(prices)?;
         let mut equity = self.cash_1e8.0;
-        for v in vals {
+        for &v in &vals {
             equity = equity
                 .checked_add(v)
                 .ok_or(DomainError::ArithmeticOverflow)?;
         }
 
         if equity <= 0 {
-            return Ok([0.0; UNIVERSE_LEN]);
+            return Ok(vec![0.0; self.num_assets]);
         }
 
         let eq_f64 = equity as f64;
-        let mut weights = [0.0f64; UNIVERSE_LEN];
-        for i in 0..UNIVERSE_LEN {
-            weights[i] = (vals[i] as f64) / eq_f64;
+        let mut weights = Vec::with_capacity(self.num_assets);
+        for v in vals {
+            weights.push((v as f64) / eq_f64);
         }
         Ok(weights)
     }
@@ -292,7 +334,7 @@ impl SpotPortfolioLedger {
         lhs.checked_sub(rhs).ok_or(DomainError::ArithmeticOverflow)
     }
 
-    pub fn drift_mtm_1e8(&self, prices: &[Price1e8; UNIVERSE_LEN]) -> Result<i128, DomainError> {
+    pub fn drift_mtm_1e8(&self, prices: &[Price1e8]) -> Result<i128, DomainError> {
         let equity = self.equity_1e8(prices)?.0;
         let unrealized = self.unrealized_pnl_1e8(prices)?.0;
         let realized_net = self
@@ -320,7 +362,7 @@ impl SpotPortfolioLedger {
         Ok(())
     }
 
-    pub fn assert_zero_drift(&self, prices: &[Price1e8; UNIVERSE_LEN]) -> Result<(), DomainError> {
+    pub fn assert_zero_drift(&self, prices: &[Price1e8]) -> Result<(), DomainError> {
         self.assert_book_zero_drift()?;
         let mtm_drift = self.drift_mtm_1e8(prices)?;
         if mtm_drift != 0 {
@@ -333,12 +375,16 @@ impl SpotPortfolioLedger {
 
     pub fn apply_buy_fill(
         &mut self,
-        symbol: Symbol,
+        id: SymbolId,
         quote_spent_1e8: Money1e8,
         gross_base_qty_1e8: Qty1e8,
         fee_base_reported_1e8: Qty1e8,
         base_precision: Qty1e8,
     ) -> Result<(), DomainError> {
+        let idx = id.index();
+        if idx >= self.num_assets {
+            return Err(DomainError::InvalidParameter("symbol_id out of bounds"));
+        }
         if quote_spent_1e8.0 < 0 {
             return Err(DomainError::NegativeValueNotAllowed("quote_spent_1e8"));
         }
@@ -381,7 +427,6 @@ impl SpotPortfolioLedger {
             gross_base_qty_1e8.0,
         )?);
 
-        let idx = symbol.index();
         let new_cash = self.cash_1e8.checked_sub(quote_spent_1e8)?;
         let new_qty = self.positions[idx].qty_1e8.checked_add(net_qty)?;
         let new_cost = self.positions[idx]
@@ -402,11 +447,16 @@ impl SpotPortfolioLedger {
 
     pub fn apply_sell_fill(
         &mut self,
-        symbol: Symbol,
+        id: SymbolId,
+        symbol_label: &str,
         sell_qty_1e8: Qty1e8,
         gross_quote_1e8: Money1e8,
         fee_usdt_1e8: Money1e8,
     ) -> Result<(), DomainError> {
+        let idx = id.index();
+        if idx >= self.num_assets {
+            return Err(DomainError::InvalidParameter("symbol_id out of bounds"));
+        }
         if sell_qty_1e8.0 < 0 {
             return Err(DomainError::NegativeValueNotAllowed("sell_qty_1e8"));
         }
@@ -422,11 +472,10 @@ impl SpotPortfolioLedger {
             return Err(DomainError::NegativeValueNotAllowed("fee_usdt_1e8"));
         }
 
-        let idx = symbol.index();
         let pos = self.positions[idx];
         if sell_qty_1e8 > pos.qty_1e8 {
             return Err(DomainError::InsufficientPosition {
-                symbol: symbol.to_string(),
+                symbol: symbol_label.to_string(),
                 required: sell_qty_1e8.0,
                 available: pos.qty_1e8.0,
             });
@@ -469,7 +518,7 @@ impl SpotPortfolioLedger {
     pub fn record_external_deposit(
         &mut self,
         amount_1e8: Money1e8,
-        prices: &[Price1e8; UNIVERSE_LEN],
+        prices: &[Price1e8],
     ) -> Result<Vec<DomainEvent>, DomainError> {
         if amount_1e8.0 < 0 {
             return Err(DomainError::NegativeValueNotAllowed("deposit amount_1e8"));
@@ -504,7 +553,7 @@ impl SpotPortfolioLedger {
     pub fn record_external_withdrawal(
         &mut self,
         amount_1e8: Money1e8,
-        prices: &[Price1e8; UNIVERSE_LEN],
+        prices: &[Price1e8],
     ) -> Result<Option<DomainEvent>, DomainError> {
         if amount_1e8.0 < 0 {
             return Err(DomainError::NegativeValueNotAllowed(
@@ -543,7 +592,7 @@ impl SpotPortfolioLedger {
 
     pub fn mark_to_market(
         &mut self,
-        prices: &[Price1e8; UNIVERSE_LEN],
+        prices: &[Price1e8],
     ) -> Result<Option<DomainEvent>, DomainError> {
         self.assert_zero_drift(prices)?;
         let equity = self.equity_1e8(prices)?;
@@ -580,19 +629,21 @@ impl SpotPortfolioLedger {
 mod tests {
     use super::*;
 
-    fn unit_prices(v: i128) -> [Price1e8; UNIVERSE_LEN] {
-        [Price1e8(v); UNIVERSE_LEN]
+    fn unit_prices(n: usize, v: i128) -> Vec<Price1e8> {
+        vec![Price1e8(v); n]
     }
 
     #[test]
     fn buy_sell_fee_asymmetry_and_zero_drift() -> Result<(), DomainError> {
         let initial = Money1e8(100_000_000_000); // 1000 USDT
-        let mut ledger = SpotPortfolioLedger::new(initial)?;
-        let prices = unit_prices(10_000_000_000); // 100 USDT
+        let n = 6usize;
+        let btc_id = SymbolId(0);
+        let mut ledger = SpotPortfolioLedger::new(initial, n)?;
+        let prices = unit_prices(n, 10_000_000_000); // 100 USDT
 
         // Buy 500 USDT worth -> 5.00 gross base, 0.005 base fee, step 0.001 => net 4.995
         ledger.apply_buy_fill(
-            Symbol::BtcUsdt,
+            btc_id,
             Money1e8(50_000_000_000),
             Qty1e8(500_000_000),
             Qty1e8(500_000),
@@ -600,12 +651,9 @@ mod tests {
         )?;
 
         assert_eq!(ledger.cash_1e8(), Money1e8(50_000_000_000));
+        assert_eq!(ledger.position(btc_id)?.qty_1e8, Qty1e8(499_500_000));
         assert_eq!(
-            ledger.position(Symbol::BtcUsdt).qty_1e8,
-            Qty1e8(499_500_000)
-        );
-        assert_eq!(
-            ledger.position(Symbol::BtcUsdt).cost_basis_usdt_1e8,
+            ledger.position(btc_id)?.cost_basis_usdt_1e8,
             Money1e8(50_000_000_000)
         );
         assert_eq!(ledger.cum_buy_fees_usdt_est_1e8(), Money1e8(50_000_000));
@@ -613,15 +661,17 @@ mod tests {
         ledger.assert_zero_drift(&prices)?;
 
         // Partial sell 2.00 BTC at 120 USDT => gross 240, fee 0.24 USDT
-        let sell_prices = [
+        let sell_prices = vec![
             Price1e8(12_000_000_000),
+            Price1e8(10_000_000_000),
             Price1e8(10_000_000_000),
             Price1e8(10_000_000_000),
             Price1e8(10_000_000_000),
             Price1e8(10_000_000_000),
         ];
         ledger.apply_sell_fill(
-            Symbol::BtcUsdt,
+            btc_id,
+            "BTCUSDT",
             Qty1e8(200_000_000),
             Money1e8(24_000_000_000),
             Money1e8(24_000_000),
@@ -632,30 +682,30 @@ mod tests {
         ledger.assert_zero_drift(&sell_prices)?;
 
         // Full sell of remaining BTC
-        let rem = ledger.position(Symbol::BtcUsdt).qty_1e8;
+        let rem = ledger.position(btc_id)?.qty_1e8;
         ledger.apply_sell_fill(
-            Symbol::BtcUsdt,
+            btc_id,
+            "BTCUSDT",
             rem,
             Money1e8(35_940_000_000),
             Money1e8(35_940_000),
         )?;
-        assert_eq!(ledger.position(Symbol::BtcUsdt).qty_1e8, Qty1e8::ZERO);
-        assert_eq!(
-            ledger.position(Symbol::BtcUsdt).cost_basis_usdt_1e8,
-            Money1e8::ZERO
-        );
+        assert_eq!(ledger.position(btc_id)?.qty_1e8, Qty1e8::ZERO);
+        assert_eq!(ledger.position(btc_id)?.cost_basis_usdt_1e8, Money1e8::ZERO);
         ledger.assert_zero_drift(&sell_prices)?;
         Ok(())
     }
 
     #[test]
     fn deposit_and_withdrawal_preserve_twr_and_drift() -> Result<(), DomainError> {
-        let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000))?; // 1000
-        let prices = unit_prices(10_000_000_000); // 100
+        let n = 6usize;
+        let eth_id = SymbolId(1);
+        let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000), n)?; // 1000
+        let prices = unit_prices(n, 10_000_000_000); // 100
 
         // Buy 500 USDT of ETH (5.0 ETH, 0 fee for clean MTM math)
         ledger.apply_buy_fill(
-            Symbol::EthUsdt,
+            eth_id,
             Money1e8(50_000_000_000),
             Qty1e8(500_000_000),
             Qty1e8::ZERO,
@@ -664,7 +714,7 @@ mod tests {
         ledger.assert_zero_drift(&prices)?;
 
         // Price doubles to 200 -> equity = 500 cash + 1000 ETH = 1500 -> TWR = 1.5
-        let up_prices = unit_prices(20_000_000_000);
+        let up_prices = unit_prices(n, 20_000_000_000);
         let ev = ledger.mark_to_market(&up_prices)?;
         assert!(ev.is_none());
         assert_eq!(ledger.twr_index_1e10(), Rate1e10(15_000_000_000));
@@ -688,9 +738,11 @@ mod tests {
 
     #[test]
     fn hard_drawdown_halt_triggers_above_25_percent() -> Result<(), DomainError> {
-        let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000))?; // 1000
+        let n = 6usize;
+        let sol_id = SymbolId(2);
+        let mut ledger = SpotPortfolioLedger::new(Money1e8(100_000_000_000), n)?; // 1000
         ledger.apply_buy_fill(
-            Symbol::SolUsdt,
+            sol_id,
             Money1e8(100_000_000_000),
             Qty1e8(1_000_000_000),
             Qty1e8::ZERO,
@@ -698,15 +750,50 @@ mod tests {
         )?;
 
         // Drop 25.00% -> 75 -> NOT > 25%, no halt
-        let p_25 = unit_prices(7_500_000_000);
+        let p_25 = unit_prices(n, 7_500_000_000);
         assert!(ledger.mark_to_market(&p_25)?.is_none());
         assert!(!ledger.is_halted());
 
         // Drop to 74 -> 26% DD -> triggers HardDrawdownHalt
-        let p_26 = unit_prices(7_400_000_000);
+        let p_26 = unit_prices(n, 7_400_000_000);
         let ev = ledger.mark_to_market(&p_26)?;
         assert!(matches!(ev, Some(DomainEvent::HardDrawdownHalt { .. })));
         assert!(ledger.is_halted());
+        Ok(())
+    }
+
+    #[test]
+    fn variable_n_1_6_20_zero_drift_and_length_guards() -> Result<(), DomainError> {
+        for n in [1usize, 6usize, MAX_UNIVERSE_ASSETS] {
+            let mut ledger = SpotPortfolioLedger::new(Money1e8(50_000_000_000), n)?;
+            let last_id = SymbolId(n - 1);
+            ledger.apply_buy_fill(
+                last_id,
+                Money1e8(20_000_000_000),
+                Qty1e8(200_000_000),
+                Qty1e8(200_000),
+                Qty1e8(100_000),
+            )?;
+            let prices = unit_prices(n, 10_000_000_000);
+            assert_eq!(ledger.drift_book_1e8()?, 0);
+            assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+            let bad_prices = unit_prices(n + 1, 10_000_000_000);
+            assert!(matches!(
+                ledger.equity_1e8(&bad_prices),
+                Err(DomainError::CorruptStateLength {
+                    field: "prices_1e8",
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            SpotPortfolioLedger::new(Money1e8(1_000_000_000), 0),
+            Err(DomainError::InvalidUniverse(_))
+        ));
+        assert!(matches!(
+            SpotPortfolioLedger::new(Money1e8(1_000_000_000), MAX_UNIVERSE_ASSETS + 1),
+            Err(DomainError::InvalidUniverse(_))
+        ));
         Ok(())
     }
 }

@@ -5,8 +5,8 @@ use crate::domain::indicators::{
 };
 use crate::domain::types::{
     mul_div_floor_nonneg, mul_div_round, Candle, InstrumentRules, Money1e8, OrderSide,
-    PlannedOrder, PositionState, Price1e8, Qty1e8, Rate1e10, Symbol, FOUR_HOURS_MS, ONE_HOUR_MS,
-    RATE_SCALE_1E10, SCALE_1E8, UNIVERSE_LEN,
+    PlannedOrder, PositionState, Price1e8, Qty1e8, Rate1e10, Universe, FOUR_HOURS_MS,
+    MAX_UNIVERSE_ASSETS, MIN_UNIVERSE_ASSETS, ONE_HOUR_MS, RATE_SCALE_1E10, SCALE_1E8,
 };
 
 pub const SIGMA_TARGET: f64 = 0.50;
@@ -25,21 +25,22 @@ pub const MIN_CLOSED_4H_CANDLES: usize = 147;
 pub struct SignalOutput {
     pub last_open_ts_ms: i64,
     pub last_close_ts_ms: i64,
-    pub sigma_bar: [f64; UNIVERSE_LEN],
-    pub sigma_ann: [f64; UNIVERSE_LEN],
-    pub tsmom: [f64; UNIVERSE_LEN],
-    pub raw_weights: [f64; UNIVERSE_LEN],
-    pub target_weights: [f64; UNIVERSE_LEN],
+    pub sigma_bar: Vec<f64>,
+    pub sigma_ann: Vec<f64>,
+    pub tsmom: Vec<f64>,
+    pub raw_weights: Vec<f64>,
+    pub target_weights: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RebalancePlanInput<'a> {
+    pub universe: &'a Universe,
     pub cash_1e8: Money1e8,
-    pub positions: &'a [PositionState; UNIVERSE_LEN],
-    pub prices_1e8: &'a [Price1e8; UNIVERSE_LEN],
-    pub rules: &'a [InstrumentRules; UNIVERSE_LEN],
-    pub target_weights: &'a [f64; UNIVERSE_LEN],
-    pub current_weights: &'a [f64; UNIVERSE_LEN],
+    pub positions: &'a [PositionState],
+    pub prices_1e8: &'a [Price1e8],
+    pub rules: &'a [InstrumentRules],
+    pub target_weights: &'a [f64],
+    pub current_weights: &'a [f64],
     pub fee_rate: Rate1e10,
     pub allow_buys: bool,
 }
@@ -158,11 +159,25 @@ pub fn is_4h_utc_close(last_closed_1h_open_ts_ms: i64) -> bool {
 }
 
 pub fn compute_vol_targeted_weights(
-    sigma_ann: &[f64; UNIVERSE_LEN],
-    tsmom: &[f64; UNIVERSE_LEN],
-) -> Result<([f64; UNIVERSE_LEN], [f64; UNIVERSE_LEN]), DomainError> {
-    let mut raw = [0.0f64; UNIVERSE_LEN];
-    for i in 0..UNIVERSE_LEN {
+    sigma_ann: &[f64],
+    tsmom: &[f64],
+) -> Result<(Vec<f64>, Vec<f64>), DomainError> {
+    let n = sigma_ann.len();
+    if !(MIN_UNIVERSE_ASSETS..=MAX_UNIVERSE_ASSETS).contains(&n) {
+        return Err(DomainError::InvalidUniverse(format!(
+            "universe size {n} out of bounds ({MIN_UNIVERSE_ASSETS}..={MAX_UNIVERSE_ASSETS})"
+        )));
+    }
+    if tsmom.len() != n {
+        return Err(DomainError::CorruptStateLength {
+            field: "tsmom",
+            expected: n,
+            actual: tsmom.len(),
+        });
+    }
+
+    let mut raw = Vec::with_capacity(n);
+    for i in 0..n {
         if !sigma_ann[i].is_finite() || sigma_ann[i] <= 0.0 {
             return Err(DomainError::InvalidParameter(
                 "sigma_ann must be finite and positive",
@@ -172,7 +187,8 @@ pub fn compute_vol_targeted_weights(
             return Err(DomainError::InvalidParameter("tsmom must be finite"));
         }
         let denom = sigma_ann[i].max(VOL_FLOOR_ANN);
-        raw[i] = ((SIGMA_TARGET / 4.0) / denom * tsmom[i]).clamp(0.0, W_MAX);
+        // Frozen B2-01/A0_4H scaling: keep numerator (SIGMA_TARGET / 4.0) = 0.125 independent of N.
+        raw.push(((SIGMA_TARGET / 4.0) / denom * tsmom[i]).clamp(0.0, W_MAX));
     }
 
     let sum_raw: f64 = raw.iter().sum();
@@ -182,29 +198,35 @@ pub fn compute_vol_targeted_weights(
         1.0
     };
 
-    let mut weights = [0.0f64; UNIVERSE_LEN];
-    for i in 0..UNIVERSE_LEN {
-        weights[i] = raw[i] * scale;
+    let mut weights = Vec::with_capacity(n);
+    for &r in &raw {
+        weights.push(r * scale);
     }
 
     Ok((raw, weights))
 }
 
 fn compute_signals_impl(
-    candles_by_symbol: &[Vec<Candle>; UNIVERSE_LEN],
+    candles_by_symbol: &[Vec<Candle>],
     min_candles: usize,
     n_eff: usize,
     bars_per_day: f64,
     lookbacks: &[(usize, f64)],
     interval_ms: i64,
 ) -> Result<SignalOutput, DomainError> {
-    let mut sigma_bar_arr = [0.0f64; UNIVERSE_LEN];
-    let mut sigma_ann_arr = [0.0f64; UNIVERSE_LEN];
-    let mut tsmom_arr = [0.0f64; UNIVERSE_LEN];
+    let n = candles_by_symbol.len();
+    if !(MIN_UNIVERSE_ASSETS..=MAX_UNIVERSE_ASSETS).contains(&n) {
+        return Err(DomainError::InvalidUniverse(format!(
+            "candles universe size {n} out of bounds ({MIN_UNIVERSE_ASSETS}..={MAX_UNIVERSE_ASSETS})"
+        )));
+    }
+
+    let mut sigma_bar_vec = Vec::with_capacity(n);
+    let mut sigma_ann_vec = Vec::with_capacity(n);
+    let mut tsmom_vec = Vec::with_capacity(n);
     let mut last_open_ts_ms = 0i64;
 
-    for i in 0..UNIVERSE_LEN {
-        let candles = &candles_by_symbol[i];
+    for (i, candles) in candles_by_symbol.iter().enumerate() {
         if candles.len() < min_candles {
             return Err(DomainError::InsufficientHistory {
                 required: min_candles,
@@ -225,9 +247,14 @@ fn compute_signals_impl(
         let sigma_bars: Vec<f64> = vols.iter().map(|v| v.sigma_bar).collect();
 
         let last_idx = candles.len() - 1;
-        sigma_bar_arr[i] = vols[last_idx].sigma_bar;
-        sigma_ann_arr[i] = vols[last_idx].sigma_ann;
-        tsmom_arr[i] = tsmom_multi_horizon_at(&closes, &sigma_bars, lookbacks, last_idx)?;
+        sigma_bar_vec.push(vols[last_idx].sigma_bar);
+        sigma_ann_vec.push(vols[last_idx].sigma_ann);
+        tsmom_vec.push(tsmom_multi_horizon_at(
+            &closes,
+            &sigma_bars,
+            lookbacks,
+            last_idx,
+        )?);
 
         let sym_last_ts = candles[last_idx].open_ts_ms;
         if i == 0 || sym_last_ts > last_open_ts_ms {
@@ -235,7 +262,7 @@ fn compute_signals_impl(
         }
     }
 
-    let (raw_weights, target_weights) = compute_vol_targeted_weights(&sigma_ann_arr, &tsmom_arr)?;
+    let (raw_weights, target_weights) = compute_vol_targeted_weights(&sigma_ann_vec, &tsmom_vec)?;
     let last_close_ts_ms = last_open_ts_ms
         .checked_add(interval_ms)
         .ok_or(DomainError::ArithmeticOverflow)?;
@@ -243,16 +270,16 @@ fn compute_signals_impl(
     Ok(SignalOutput {
         last_open_ts_ms,
         last_close_ts_ms,
-        sigma_bar: sigma_bar_arr,
-        sigma_ann: sigma_ann_arr,
-        tsmom: tsmom_arr,
+        sigma_bar: sigma_bar_vec,
+        sigma_ann: sigma_ann_vec,
+        tsmom: tsmom_vec,
         raw_weights,
         target_weights,
     })
 }
 
 pub fn compute_b2_01_signals(
-    closed_1h_by_symbol: &[Vec<Candle>; UNIVERSE_LEN],
+    closed_1h_by_symbol: &[Vec<Candle>],
 ) -> Result<SignalOutput, DomainError> {
     compute_signals_impl(
         closed_1h_by_symbol,
@@ -265,7 +292,7 @@ pub fn compute_b2_01_signals(
 }
 
 pub fn compute_a0_4h_signals(
-    closed_4h_by_symbol: &[Vec<Candle>; UNIVERSE_LEN],
+    closed_4h_by_symbol: &[Vec<Candle>],
 ) -> Result<SignalOutput, DomainError> {
     compute_signals_impl(
         closed_4h_by_symbol,
@@ -283,6 +310,17 @@ pub fn should_rebalance(target_w: f64, current_w: f64) -> bool {
         || (target_w < LIQUIDATE_TARGET_THRESH && current_w >= LIQUIDATE_CURRENT_THRESH)
 }
 
+fn check_slice_len(field: &'static str, expected: usize, actual: usize) -> Result<(), DomainError> {
+    if actual != expected {
+        return Err(DomainError::CorruptStateLength {
+            field,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 pub fn plan_rebalance_orders(
     input: &RebalancePlanInput<'_>,
 ) -> Result<Vec<PlannedOrder>, DomainError> {
@@ -293,12 +331,25 @@ pub fn plan_rebalance_orders(
         return Err(DomainError::NegativeValueNotAllowed("fee_rate"));
     }
 
-    let mut pos_vals_1e8 = [0i128; UNIVERSE_LEN];
+    let n = input.universe.len();
+    check_slice_len("positions", n, input.positions.len())?;
+    check_slice_len("prices_1e8", n, input.prices_1e8.len())?;
+    check_slice_len("rules", n, input.rules.len())?;
+    check_slice_len("target_weights", n, input.target_weights.len())?;
+    check_slice_len("current_weights", n, input.current_weights.len())?;
+
+    let mut pos_vals_1e8 = Vec::with_capacity(n);
     let mut equity_1e8 = input.cash_1e8.0;
 
-    for (i, pos_val_slot) in pos_vals_1e8.iter_mut().enumerate() {
+    for (id, sym) in input.universe.iter_with_ids() {
+        let i = id.index();
         let rule = &input.rules[i];
-        let sym = Symbol::ALL[i];
+        if rule.symbol != *sym {
+            return Err(DomainError::InvalidInstrumentRules(format!(
+                "rules[{i}] symbol '{}' does not match universe symbol '{sym}'",
+                rule.symbol
+            )));
+        }
         if !rule.is_trading {
             return Err(DomainError::InvalidInstrumentRules(format!(
                 "symbol {sym} is not trading"
@@ -338,7 +389,7 @@ pub fn plan_rebalance_orders(
             input.prices_1e8[i].0,
             SCALE_1E8,
         )?;
-        *pos_val_slot = pos_val;
+        pos_vals_1e8.push(pos_val);
         equity_1e8 = equity_1e8
             .checked_add(pos_val)
             .ok_or(DomainError::ArithmeticOverflow)?;
@@ -351,7 +402,9 @@ pub fn plan_rebalance_orders(
     let mut sells: Vec<PlannedOrder> = Vec::new();
     let mut buy_candidates: Vec<BuyCandidate> = Vec::new();
 
-    for (i, &current_val_1e8) in pos_vals_1e8.iter().enumerate() {
+    for (id, sym) in input.universe.iter_with_ids() {
+        let i = id.index();
+        let current_val_1e8 = pos_vals_1e8[i];
         let raw_target_w = input.target_weights[i];
         let current_w = input.current_weights[i];
         if !should_rebalance(raw_target_w, current_w) {
@@ -373,7 +426,8 @@ pub fn plan_rebalance_orders(
             let notional_1e8 = mul_div_floor_nonneg(sellable.0, price.0, SCALE_1E8)?;
             if sellable >= rule.min_order_qty && Money1e8(notional_1e8) >= rule.min_order_amt {
                 sells.push(PlannedOrder {
-                    symbol: Symbol::ALL[i],
+                    symbol_id: id,
+                    symbol: sym.clone(),
                     side: OrderSide::Sell,
                     quote_spend_1e8: Money1e8(notional_1e8),
                     base_qty_1e8: sellable,
@@ -410,7 +464,8 @@ pub fn plan_rebalance_orders(
             let sell_notional = mul_div_floor_nonneg(sell_qty.0, price.0, SCALE_1E8)?;
             if sell_qty >= rule.min_order_qty && Money1e8(sell_notional) >= rule.min_order_amt {
                 sells.push(PlannedOrder {
-                    symbol: Symbol::ALL[i],
+                    symbol_id: id,
+                    symbol: sym.clone(),
                     side: OrderSide::Sell,
                     quote_spend_1e8: Money1e8(sell_notional),
                     base_qty_1e8: sell_qty,
@@ -475,8 +530,15 @@ pub fn plan_rebalance_orders(
                 let raw_qty = mul_div_floor_nonneg(scaled_quote, SCALE_1E8, price.0)?;
                 let est_qty = Qty1e8(raw_qty).floor_to_step(rule.base_precision)?;
                 if est_qty >= rule.min_order_qty {
+                    let sym_id = crate::domain::types::SymbolId(cand.idx);
+                    let sym = input
+                        .universe
+                        .get(sym_id)
+                        .ok_or(DomainError::InvalidParameter("symbol_id out of bounds"))?
+                        .clone();
                     orders.push(PlannedOrder {
-                        symbol: Symbol::ALL[cand.idx],
+                        symbol_id: sym_id,
+                        symbol: sym,
                         side: OrderSide::Buy,
                         quote_spend_1e8: Money1e8(scaled_quote),
                         base_qty_1e8: est_qty,
@@ -496,6 +558,7 @@ pub fn plan_rebalance_orders(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::types::{AssetSymbol, SymbolId};
 
     fn mk_candle(ts: i64, open: f64, high: f64, low: f64, close: f64, vol: f64) -> Candle {
         Candle {
@@ -509,9 +572,9 @@ mod tests {
         }
     }
 
-    fn mk_rules(sym: Symbol) -> InstrumentRules {
+    fn mk_rules(sym: &AssetSymbol) -> InstrumentRules {
         InstrumentRules {
-            symbol: sym,
+            symbol: sym.clone(),
             base_precision: Qty1e8(1_000_000),    // 0.01
             quote_precision: Money1e8(1_000_000), // 0.01
             min_order_qty: Qty1e8(1_000_000),     // 0.01
@@ -557,12 +620,14 @@ mod tests {
 
     #[test]
     fn vol_targeted_weights_respect_caps_and_l_max() -> Result<(), DomainError> {
-        let sigma_ann = [0.20, 0.10, 0.25, 0.30, 0.20];
-        let tsmom = [0.95, 0.95, 0.95, 0.95, -0.50];
+        let sigma_ann = [0.20, 0.10, 0.25, 0.30, 0.20, 0.12];
+        let tsmom = [0.95, 0.95, 0.95, 0.95, -0.50, 0.30];
         let (raw, w) = compute_vol_targeted_weights(&sigma_ann, &tsmom)?;
         assert!((raw[0] - W_MAX).abs() < 1e-12);
         assert!((raw[1] - W_MAX).abs() < 1e-12);
         assert_eq!(raw[4], 0.0);
+        // XAUT low vol (12% clamped to 0.15 floor): (0.125 / 0.15) * 0.30 = 0.25
+        assert!((raw[5] - 0.25).abs() < 1e-12);
         let sum_w: f64 = w.iter().sum();
         assert!(sum_w <= L_MAX + 1e-12);
         Ok(())
@@ -570,32 +635,23 @@ mod tests {
 
     #[test]
     fn plan_rebalance_sell_first_anti_dust_and_buy_reserve() -> Result<(), DomainError> {
-        let rules = [
-            mk_rules(Symbol::BtcUsdt),
-            mk_rules(Symbol::EthUsdt),
-            mk_rules(Symbol::SolUsdt),
-            mk_rules(Symbol::LinkUsdt),
-            mk_rules(Symbol::AvaxUsdt),
-        ];
-        let prices = [
-            Price1e8(10_000_000_000), // 100
-            Price1e8(10_000_000_000), // 100
-            Price1e8(10_000_000_000), // 100
-            Price1e8(10_000_000_000), // 100
-            Price1e8(10_000_000_000), // 100
-        ];
+        let universe = Universe::default_universe()?;
+        let n = universe.len();
+        let rules: Vec<InstrumentRules> = universe.symbols().iter().map(mk_rules).collect();
+        let prices = vec![Price1e8(10_000_000_000); n];
         // Portfolio: 0 cash, 1.03 BTC ($103) -> total equity $103.
         // Target BTC = 0.02 ($2.06) => remainder $2.06 < $5 min_order_amt => escalate to full liquidation!
         // Target ETH = 0.40 ($41.2) => Buy scaled into budget after 0.30% reserve.
-        let mut positions = [PositionState::default(); UNIVERSE_LEN];
+        let mut positions = vec![PositionState::default(); n];
         positions[0] = PositionState {
             qty_1e8: Qty1e8(103_000_000), // 1.03
             cost_basis_usdt_1e8: Money1e8(10_300_000_000),
         };
-        let current_weights = [1.0, 0.0, 0.0, 0.0, 0.0];
-        let target_weights = [0.02, 0.40, 0.0, 0.0, 0.0];
+        let current_weights = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let target_weights = [0.02, 0.40, 0.0, 0.0, 0.0, 0.0];
 
         let input = RebalancePlanInput {
+            universe: &universe,
             cash_1e8: Money1e8::ZERO,
             positions: &positions,
             prices_1e8: &prices,
@@ -609,12 +665,14 @@ mod tests {
         let orders = plan_rebalance_orders(&input)?;
         assert_eq!(orders.len(), 2);
         assert_eq!(orders[0].side, OrderSide::Sell);
-        assert_eq!(orders[0].symbol, Symbol::BtcUsdt);
+        assert_eq!(orders[0].symbol_id, SymbolId(0));
+        assert_eq!(orders[0].symbol.as_str(), "BTCUSDT");
         assert!(orders[0].full_liquidation);
         assert_eq!(orders[0].base_qty_1e8, Qty1e8(103_000_000));
 
         assert_eq!(orders[1].side, OrderSide::Buy);
-        assert_eq!(orders[1].symbol, Symbol::EthUsdt);
+        assert_eq!(orders[1].symbol_id, SymbolId(1));
+        assert_eq!(orders[1].symbol.as_str(), "ETHUSDT");
         assert!(orders[1].quote_spend_1e8.0 > 0);
         Ok(())
     }
@@ -633,30 +691,20 @@ mod tests {
                 10.0,
             ));
         }
-        let universe_1h = [
-            bars_1h.clone(),
-            bars_1h.clone(),
-            bars_1h.clone(),
-            bars_1h.clone(),
-            bars_1h.clone(),
-        ];
+        let universe_1h = vec![bars_1h.clone(); 6];
         let sig_1h = compute_b2_01_signals(&universe_1h)?;
         assert_eq!(
             sig_1h.last_open_ts_ms,
             ((MIN_CLOSED_1H_CANDLES - 1) as i64) * ONE_HOUR_MS
         );
+        assert_eq!(sig_1h.target_weights.len(), 6);
         assert!(sig_1h.target_weights.iter().all(|w| *w >= 0.0));
 
         let bars_4h = aggregate_1h_to_4h(&bars_1h)?;
         assert!(bars_4h.len() >= MIN_CLOSED_4H_CANDLES);
-        let universe_4h = [
-            bars_4h.clone(),
-            bars_4h.clone(),
-            bars_4h.clone(),
-            bars_4h.clone(),
-            bars_4h,
-        ];
+        let universe_4h = vec![bars_4h; 6];
         let sig_4h = compute_a0_4h_signals(&universe_4h)?;
+        assert_eq!(sig_4h.target_weights.len(), 6);
         assert!(sig_4h.tsmom[0] > 0.0);
         Ok(())
     }

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::domain::error::InfraError;
-use crate::domain::types::Money1e8;
+use crate::domain::types::{Money1e8, Universe};
 
 pub const LIVE_ACK_MAGIC: &str = "YES_I_ACCEPT_0X_SPOT_RISK";
 pub const DEFAULT_BYBIT_BASE_URL: &str = "https://api.bybit.com";
@@ -29,6 +29,7 @@ pub struct AppConfig {
     pub state_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub max_clock_skew_ms: i64,
+    pub universe: Universe,
 }
 
 impl fmt::Debug for AppConfig {
@@ -49,6 +50,7 @@ impl fmt::Debug for AppConfig {
             .field("state_dir", &self.state_dir)
             .field("logs_dir", &self.logs_dir)
             .field("max_clock_skew_ms", &self.max_clock_skew_ms)
+            .field("universe", &self.universe.as_csv())
             .finish()
     }
 }
@@ -168,6 +170,14 @@ impl AppConfig {
             ));
         }
 
+        let universe = match non_empty_opt(map.get("M2B_UNIVERSE_SYMBOLS")) {
+            Some(raw) => Universe::parse_csv(&raw).map_err(|e| {
+                InfraError::Config(format!("invalid M2B_UNIVERSE_SYMBOLS '{raw}': {e}"))
+            })?,
+            None => Universe::default_universe()
+                .map_err(|e| InfraError::Config(format!("invalid default universe: {e}")))?,
+        };
+
         Ok(Self {
             bybit_base_url,
             api_key,
@@ -181,6 +191,7 @@ impl AppConfig {
             state_dir,
             logs_dir,
             max_clock_skew_ms,
+            universe,
         })
     }
 }
@@ -263,6 +274,7 @@ fn strip_inline_comment(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::types::DEFAULT_UNIVERSE_CSV;
 
     #[test]
     fn test_dotenv_parser_and_token_fallback() {
@@ -280,9 +292,45 @@ BYBIT_SPOT_ACK_LIVE='YES_I_ACCEPT_0X_SPOT_RISK'
             assert_eq!(c.telegram_bot_token, "legacy_tok");
             assert_eq!(c.paper_initial_cash_1e8, Money1e8(250_050_000_000));
             assert!(c.live_ack_valid);
+            assert_eq!(c.universe.as_csv(), DEFAULT_UNIVERSE_CSV);
+            assert_eq!(c.universe.len(), 6);
             let dbg = format!("{c:?}");
             assert!(!dbg.contains("legacy_tok"));
             assert!(dbg.contains("[REDACTED]"));
+            assert!(dbg.contains("XAUTUSDT"));
         }
+    }
+
+    #[test]
+    fn test_universe_env_parsing_and_fail_closed_validation() {
+        let mut map = HashMap::new();
+        map.insert(
+            "M2B_UNIVERSE_SYMBOLS".to_string(),
+            " btcusdt , xautusdt ".to_string(),
+        );
+        let cfg = AppConfig::from_env_map(&map);
+        assert!(cfg.is_ok());
+        if let Ok(c) = cfg {
+            assert_eq!(c.universe.as_csv(), "BTCUSDT,XAUTUSDT");
+            assert_eq!(c.universe.len(), 2);
+        }
+
+        let mut empty_val = HashMap::new();
+        empty_val.insert("M2B_UNIVERSE_SYMBOLS".to_string(), "   ".to_string());
+        let cfg_default = AppConfig::from_env_map(&empty_val);
+        assert!(cfg_default.is_ok());
+        if let Ok(c) = cfg_default {
+            assert_eq!(c.universe.as_csv(), DEFAULT_UNIVERSE_CSV);
+        }
+
+        let mut dup = HashMap::new();
+        dup.insert(
+            "M2B_UNIVERSE_SYMBOLS".to_string(),
+            "BTCUSDT,btcusdt".to_string(),
+        );
+        assert!(matches!(
+            AppConfig::from_env_map(&dup),
+            Err(InfraError::Config(_))
+        ));
     }
 }
