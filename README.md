@@ -1,4 +1,4 @@
-# VORTEX-M2B-SPOT v1.1.0
+# VORTEX-M2B-SPOT v1.1.1
 
 Deterministic `1h` Spot `0x` TSMOM Vol-Targeted execution engine (`B2-01`) with a parallel `4h` shadow telemetry book (`A0_4H`) for Bybit Spot V5 (`UNIFIED` account, `LONG_FLAT`, zero leverage, zero short selling), supporting a configurable Spot `*USDT` universe (default 6 pairs including `XAUTUSDT`) and Fail-Closed `schema_version = 2` persistence.
 
@@ -15,6 +15,7 @@ Deterministic `1h` Spot `0x` TSMOM Vol-Targeted execution engine (`B2-01`) with 
 - **Default Pairs (`6`)**: `BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `LINKUSDT`, `AVAXUSDT`, `XAUTUSDT`
 - **State Persistence (`schema_version = 2`)**: `primary_state.json` and `m2b_shadow_4h_state.json` store `"schema_version": 2` and `"symbols": [...]`, aborting Fail-Closed on version mismatch (`v1 -> v2`), symbol/order mismatch, or corrupt vector lengths.
 - **Primary Engine (`B2-01`, `1h`)**: $N_{\text{eff}} = 84$, lookbacks $(72, 0.25), (168, 0.35), (504, 0.40)$, $\sigma_{\text{target}} = 0.50$ with frozen numerator $\sigma_{\text{target}} / 4 = 0.125$ (independent of $N$), vol floor $\max(\sigma_{\text{ann}}, 0.15)$, $W_{\max} = 0.40$, $L_{\max} = 1.00$, deadband $\delta = 0.20 \implies 0.08$.
+- **Liquidation & Compatibility (`v1.1.1`)**: Full liquidation triggers whenever `target_w < 0.015` (`LIQUIDATE_TARGET_THRESH`) for any open position (`current_w > 0.0` / `qty > 0`), gated strictly by the exchange instrument minimums (`min_order_amt` and `min_order_qty`) with silent dust skip (`0` churn, `Drift == 0`) and zero-migration hot compatibility for `v1.1.0` `schema_version = 2` state files.
 - **Shadow Engine (`A0_4H`, `4h` UTC)**: $N_{\text{eff}} = 21$, lookbacks $(18, 0.25), (42, 0.35), (126, 0.40)$, paper-only telemetry.
 
 ## CLI Usage
@@ -35,4 +36,4 @@ vortex-m2b-spot run --live-spot
 
 ## Documentation
 
-See [`DOCS/INDEX.md`](DOCS/INDEX.md), [`DOCS/PHASE_1_ARCHITECTURE_AND_VERIFICATION_REPORT.md`](DOCS/PHASE_1_ARCHITECTURE_AND_VERIFICATION_REPORT.md), [`DOCS/PHASE_2_V110_DYNAMIC_UNIVERSE_XAUT_REPORT.md`](DOCS/PHASE_2_V110_DYNAMIC_UNIVERSE_XAUT_REPORT.md), and [`DOCS/RUNBOOK_TOKIO_PAPER.md`](DOCS/RUNBOOK_TOKIO_PAPER.md).
+See [`DOCS/INDEX.md`](DOCS/INDEX.md), [`DOCS/PHASE_1_ARCHITECTURE_AND_VERIFICATION_REPORT.md`](DOCS/PHASE_1_ARCHITECTURE_AND_VERIFICATION_REPORT.md), [`DOCS/PHASE_2_V110_DYNAMIC_UNIVERSE_XAUT_REPORT.md`](DOCS/PHASE_2_V110_DYNAMIC_UNIVERSE_XAUT_REPORT.md), [`DOCS/PHASE_3_V111_LIQUIDATION_SLIT_FIX_REPORT.md`](DOCS/PHASE_3_V111_LIQUIDATION_SLIT_FIX_REPORT.md), and [`DOCS/RUNBOOK_TOKIO_PAPER.md`](DOCS/RUNBOOK_TOKIO_PAPER.md).

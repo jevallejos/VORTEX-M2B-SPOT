@@ -1,6 +1,6 @@
 # VORTEX-M2B-SPOT — Runbook Operacional (`--paper`, Tokio VPS)
 
-**Versión del motor:** `1.1.0` (`vortex-m2b-spot`, `schema_version = 2`)  
+**Versión del motor:** `1.1.1` (`vortex-m2b-spot`, `schema_version = 2`)  
 **Modo cubierto:** Validación `--paper` de 30 días (cero llamadas privadas de órdenes a Bybit)  
 **Universo por defecto (`6` pares):** `BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT`  
 **Directorio objetivo en Tokio:** `/home/ubuntu/vortex-m2b-spot`  
@@ -66,7 +66,7 @@ Verificar antes de instalar:
    M2B_UNIVERSE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT
    ```
    - **`M2B_UNIVERSE_SYMBOLS` (opcional, Fail-Closed):**
-     - Si se omite o queda vacía, `v1.1.0` utiliza exactamente `BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT` (`6` pares).
+     - Si se omite o queda vacía, `v1.1.1` utiliza exactamente `BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT` (`6` pares).
      - Si se define, debe listar entre `1` y `20` pares Spot `*USDT` únicos, ASCII alfanuméricos de longitud `6..=20` (se recortan espacios y se normalizan a mayúsculas). Cualquier duplicado, entrada vacía o par no-`USDT` aborta el arranque fail-closed.
    - Para recibir alertas en Telegram durante los 30 días de `--paper`, completar `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`.
    - Mantener `BYBIT_API_KEY=`, `BYBIT_API_SECRET=`, `BYBIT_SPOT_LIVE_EXECUTION=false` y `BYBIT_SPOT_ACK_LIVE=` vacíos/desactivados durante toda la fase `--paper`.
@@ -78,11 +78,13 @@ Verificar antes de instalar:
 
 ---
 
-## 4. Actualización `v1.0.x -> v1.1.0` y Migración Controlada (`schema_version = 1 -> 2`)
+## 4. Actualización del Motor y Contrato de Estado (`schema_version = 2`)
 
-> **REGLA FAIL-CLOSED `schema_version = 2`:** `vortex-m2b-spot` `v1.1.0` **prohíbe** migraciones silenciosas. Si existen `state/primary_state.json` o `state/m2b_shadow_4h_state.json` de `v1.0.x` (`schema_version = 1`) o generados con un orden/conjunto distinto de `M2B_UNIVERSE_SYMBOLS`, el motor abortará explícitamente con `SchemaVersionMismatch` o `UniverseMismatch` sin sobrescribir disco.
+### 4.1 Migración Controlada `v1.0.x -> v1.1.x` (`schema_version = 1 -> 2`)
 
-Si el host Tokio ya ejecutaba `v1.0.1` / `v1.0.2`, ejecutar este respaldo **antes** de correr `v1.1.0`:
+> **REGLA FAIL-CLOSED `schema_version = 2`:** `vortex-m2b-spot` `v1.1.x` **prohíbe** migraciones silenciosas. Si existen `state/primary_state.json` o `state/m2b_shadow_4h_state.json` de `v1.0.x` (`schema_version = 1`) o generados con un orden/conjunto distinto de `M2B_UNIVERSE_SYMBOLS`, el motor abortará explícitamente con `SchemaVersionMismatch` o `UniverseMismatch` sin sobrescribir disco.
+
+Si el host Tokio ejecutaba una instalación heredada `v1.0.1` / `v1.0.2` (`schema_version = 1`), ejecutar este respaldo **antes** de correr `v1.1.x`:
 
 ```bash
 # 1. Detener el temporizador y confirmar ausencia de ciclo activo
@@ -96,11 +98,35 @@ mv /home/ubuntu/vortex-m2b-spot/state/primary_state.json "${BACKUP_DIR}/" 2>/dev
 mv /home/ubuntu/vortex-m2b-spot/state/m2b_shadow_4h_state.json "${BACKUP_DIR}/" 2>/dev/null || true
 cp -a /home/ubuntu/vortex-m2b-spot/logs/m2b_audit_ledger.jsonl "${BACKUP_DIR}/" 2>/dev/null || true
 
-# 3. Actualizar código fuente a v1.1.0 y revisar .env
+# 3. Actualizar código fuente a v1.1.x y revisar .env
 cd /home/ubuntu/VORTEX-M2B-SPOT
 git pull --ff-only origin main
 grep -E '^M2B_UNIVERSE_SYMBOLS=' /home/ubuntu/vortex-m2b-spot/.env || echo "M2B_UNIVERSE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,LINKUSDT,AVAXUSDT,XAUTUSDT" >> /home/ubuntu/vortex-m2b-spot/.env
 ```
+
+## 4.2 Actualización en Caliente `v1.1.0 -> v1.1.1` (`schema_version = 2` Intacto)
+
+`vortex-m2b-spot` `v1.1.1` **conserva intacto** `STATE_SCHEMA_VERSION = 2` (`src/domain/types.rs:10`) y el esquema JSON completo de `state/primary_state.json`, `state/m2b_shadow_4h_state.json` y `logs/m2b_audit_ledger.jsonl`. La única corrección funcional reside en la eliminación de la rendija `< 2.0%` en `should_rebalance` y `plan_rebalance_orders` (`src/domain/strategy.rs:306-310,404-441`).
+
+> **ACTUALIZACIÓN EN CALIENTE SIN REINICIO NI MIGRACIÓN:** Para hosts Tokio que ya corren `v1.1.0` (`schema_version = 2`), **NO** archivar, borrar ni reiniciar `state/primary_state.json`, `state/m2b_shadow_4h_state.json`, `logs/m2b_audit_ledger.jsonl` ni `.env`. El binario `v1.1.1` carga directamente el estado `v1.1.0` existente preservando `Drift == 0`.
+
+```bash
+# 1. Ejecutar fuera de la ventana horaria (:00:15..:01:00 UTC) y confirmar ausencia de run.lock
+ls -la /home/ubuntu/vortex-m2b-spot/state/run.lock 2>/dev/null || echo "OK: no run.lock"
+
+# 2. Descargar v1.1.1 e instalar el binario atómicamente en caliente (preservando state/ y .env)
+cd /home/ubuntu/VORTEX-M2B-SPOT
+git pull --ff-only origin main && bash deploy/install_tokio.sh
+
+# 3. Verificar versión del binario instalado, salud, estado schema_version=2 y timer
+/home/ubuntu/vortex-m2b-spot/bin/vortex-m2b-spot --version
+# Esperado: vortex-m2b-spot 1.1.1
+vspot health
+vspot status
+vspot timer
+```
+
+Tras la actualización, cualquier posición abierta tradable (`>= min_order_amt` y `>= min_order_qty`) previamente atrapada en `(0%, 2.0%)` con `target_w < 0.015` (`LIQUIDATE_TARGET_THRESH`) se liquidará automáticamente al `100%` en el siguiente cierre horario UTC con `Drift == 0`, mientras los residuos de polvo sub-mínimo continuarán omitiéndose silenciosamente sin churning (`0` órdenes).
 
 ---
 

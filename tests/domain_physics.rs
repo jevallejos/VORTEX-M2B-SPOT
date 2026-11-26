@@ -10,9 +10,9 @@ use vortex_m2b_spot::domain::strategy::{
     MIN_CLOSED_1H_CANDLES, SIGMA_TARGET, VOL_FLOOR_ANN, W_MAX,
 };
 use vortex_m2b_spot::domain::types::{
-    make_order_link_id, AssetSymbol, Candle, DomainEvent, InstrumentRules, Money1e8, OrderSide,
-    PositionState, Price1e8, Qty1e8, SymbolId, Universe, FOUR_HOURS_MS, MAX_UNIVERSE_ASSETS,
-    ONE_HOUR_MS, SCALE_1E8,
+    make_order_link_id, mul_div_floor_nonneg, mul_div_round, AssetSymbol, Candle, DomainEvent,
+    InstrumentRules, Money1e8, OrderSide, PortfolioSnapshot, PositionState, Price1e8, Qty1e8,
+    Rate1e10, SymbolId, Universe, FOUR_HOURS_MS, MAX_UNIVERSE_ASSETS, ONE_HOUR_MS, SCALE_1E8,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -893,6 +893,352 @@ fn universe_validation_fail_closed_and_variable_n_accounting() -> TestResult {
                 rules[ord.symbol_id.index()].base_precision,
             )?;
         }
+        assert_eq!(ledger.drift_book_1e8()?, 0);
+        assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn post_trim_two_hour_sequence_9_6_to_1_6_to_0_liquidates_fully_zero_drift() -> TestResult {
+    let universe = Universe::default_universe()?;
+    let n = universe.len();
+    let link_id = SymbolId(3);
+    let rules: Vec<InstrumentRules> = universe
+        .symbols()
+        .iter()
+        .map(|sym| mk_rule(sym, 100_000, 100_000, 500_000_000)) // step 0.001, min_qty 0.001, min_amt $5.00
+        .collect();
+    let prices = vec![
+        Price1e8(10_000_000_000),  // BTC = $100.00
+        Price1e8(10_000_000_000),  // ETH = $100.00
+        Price1e8(10_000_000_000),  // SOL = $100.00
+        Price1e8(1_000_000_000),   // LINK = $10.00
+        Price1e8(2_000_000_000),   // AVAX = $20.00
+        Price1e8(250_000_000_000), // XAUT = $2,500.00
+    ];
+
+    // Setup: $1,060.00 initial cash; open 10.176 LINK ($101.76 = 9.6%) with zero buy fee
+    let mut ledger = SpotPortfolioLedger::new(Money1e8(106_000_000_000), n)?;
+    ledger.apply_buy_fill(
+        link_id,
+        Money1e8(10_176_000_000),
+        Qty1e8(1_017_600_000),
+        Qty1e8::ZERO,
+        rules[link_id.index()].base_precision,
+    )?;
+    assert_eq!(ledger.cash_1e8(), Money1e8(95_824_000_000));
+    assert_eq!(ledger.drift_book_1e8()?, 0);
+    assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+
+    let w0 = ledger.current_weights(&prices)?;
+    assert!((w0[link_id.index()] - 0.096).abs() < 1e-12);
+
+    // Hour 1: target_w[3] = 0.016 (partial trim 9.6% -> 1.6%)
+    let target_h1 = [0.0, 0.0, 0.0, 0.016, 0.0, 0.0];
+    let orders_h1 = plan_rebalance_orders(&RebalancePlanInput {
+        universe: &universe,
+        cash_1e8: ledger.cash_1e8(),
+        positions: ledger.positions(),
+        prices_1e8: &prices,
+        rules: &rules,
+        target_weights: &target_h1,
+        current_weights: &w0,
+        fee_rate: DEFAULT_SPOT_FEE_RATE,
+        allow_buys: true,
+    })?;
+    assert_eq!(orders_h1.len(), 1);
+    assert_eq!(orders_h1[0].side, OrderSide::Sell);
+    assert_eq!(orders_h1[0].symbol_id, link_id);
+    assert!(!orders_h1[0].full_liquidation);
+    assert_eq!(orders_h1[0].base_qty_1e8, Qty1e8(848_000_000)); // 8.480 LINK
+    assert_eq!(orders_h1[0].quote_spend_1e8, Money1e8(8_480_000_000));
+
+    let fee_h1 = Money1e8(mul_div_round(
+        orders_h1[0].quote_spend_1e8.raw(),
+        10,
+        10_000,
+    )?);
+    assert_eq!(fee_h1, Money1e8(8_480_000));
+    ledger.apply_sell_fill(
+        link_id,
+        "LINKUSDT",
+        orders_h1[0].base_qty_1e8,
+        orders_h1[0].quote_spend_1e8,
+        fee_h1,
+    )?;
+
+    assert_eq!(ledger.position(link_id)?.qty_1e8, Qty1e8(169_600_000)); // 1.696 LINK ($16.96)
+    assert_eq!(ledger.drift_book_1e8()?, 0);
+    assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+
+    let w1 = ledger.current_weights(&prices)?;
+    assert!(
+        w1[link_id.index()] > 0.015 && w1[link_id.index()] < 0.020,
+        "expected LINK weight strictly in (0.015, 0.020), got {}",
+        w1[link_id.index()]
+    );
+
+    // Hour 2: TSMOM <= 0 -> target_w[3] = 0.0; sub-2% position must liquidate fully
+    let target_h2 = [0.0; 6];
+    let orders_h2 = plan_rebalance_orders(&RebalancePlanInput {
+        universe: &universe,
+        cash_1e8: ledger.cash_1e8(),
+        positions: ledger.positions(),
+        prices_1e8: &prices,
+        rules: &rules,
+        target_weights: &target_h2,
+        current_weights: &w1,
+        fee_rate: DEFAULT_SPOT_FEE_RATE,
+        allow_buys: true,
+    })?;
+    assert_eq!(orders_h2.len(), 1);
+    assert_eq!(orders_h2[0].side, OrderSide::Sell);
+    assert_eq!(orders_h2[0].symbol_id, link_id);
+    assert!(orders_h2[0].full_liquidation);
+    assert_eq!(orders_h2[0].base_qty_1e8, Qty1e8(169_600_000));
+    assert_eq!(orders_h2[0].quote_spend_1e8, Money1e8(1_696_000_000));
+
+    let fee_h2 = Money1e8(mul_div_round(
+        orders_h2[0].quote_spend_1e8.raw(),
+        10,
+        10_000,
+    )?);
+    assert_eq!(fee_h2, Money1e8(1_696_000));
+    ledger.apply_sell_fill(
+        link_id,
+        "LINKUSDT",
+        orders_h2[0].base_qty_1e8,
+        orders_h2[0].quote_spend_1e8,
+        fee_h2,
+    )?;
+
+    assert_eq!(ledger.position(link_id)?.qty_1e8, Qty1e8::ZERO);
+    assert_eq!(
+        ledger.position(link_id)?.cost_basis_usdt_1e8,
+        Money1e8::ZERO
+    );
+    assert_eq!(ledger.drift_book_1e8()?, 0);
+    assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+
+    Ok(())
+}
+
+#[test]
+fn cash_constrained_buy_1_15_pct_then_zero_target_liquidates_fully_zero_drift() -> TestResult {
+    let universe = Universe::default_universe()?;
+    let n = universe.len();
+    let xaut_id = SymbolId(5);
+
+    let rules: Vec<InstrumentRules> = universe
+        .symbols()
+        .iter()
+        .enumerate()
+        .map(|(idx, sym)| {
+            if idx == xaut_id.index() {
+                mk_rule(sym, 1_000, 1_000, 500_000_000) // step 0.00001, min_amt $5.00
+            } else {
+                mk_rule(sym, 10_000, 10_000, 500_000_000) // step 0.0001, min_amt $5.00
+            }
+        })
+        .collect();
+
+    let prices = vec![
+        Price1e8(10_000_000_000),  // BTC = $100.00
+        Price1e8(10_000_000_000),  // ETH = $100.00
+        Price1e8(10_000_000_000),  // SOL = $100.00
+        Price1e8(10_000_000_000),  // LINK = $100.00
+        Price1e8(10_000_000_000),  // AVAX = $100.00
+        Price1e8(250_000_000_000), // XAUT = $2,500.00
+    ];
+
+    // Total equity $1,060.00: 5 pairs hold $1,047.81 (98.85%), leaving $12.19 free cash
+    let mut ledger = SpotPortfolioLedger::new(Money1e8(106_000_000_000), n)?;
+    let initial_qtys = [
+        209_560_000i128, // 2.0956 ($209.56)
+        209_560_000i128, // 2.0956 ($209.56)
+        209_560_000i128, // 2.0956 ($209.56)
+        209_560_000i128, // 2.0956 ($209.56)
+        209_570_000i128, // 2.0957 ($209.57)
+    ];
+    for (idx, &qty) in initial_qtys.iter().enumerate() {
+        let quote_spent = Money1e8(mul_div_floor_nonneg(qty, prices[idx].raw(), SCALE_1E8)?);
+        ledger.apply_buy_fill(
+            SymbolId(idx),
+            quote_spent,
+            Qty1e8(qty),
+            Qty1e8::ZERO,
+            rules[idx].base_precision,
+        )?;
+    }
+    assert_eq!(ledger.cash_1e8(), Money1e8(1_219_000_000)); // $12.19
+    assert_eq!(ledger.drift_book_1e8()?, 0);
+    assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+
+    // Hour 1: 5 existing pairs are inside deadband (|0.17 - 0.1977| < 0.08); XAUT triggers cash-constrained Buy
+    let w_pre = ledger.current_weights(&prices)?;
+    let target_h1 = [0.17, 0.17, 0.17, 0.17, 0.17, 0.15];
+    let orders_h1 = plan_rebalance_orders(&RebalancePlanInput {
+        universe: &universe,
+        cash_1e8: ledger.cash_1e8(),
+        positions: ledger.positions(),
+        prices_1e8: &prices,
+        rules: &rules,
+        target_weights: &target_h1,
+        current_weights: &w_pre,
+        fee_rate: DEFAULT_SPOT_FEE_RATE,
+        allow_buys: true,
+    })?;
+    assert_eq!(orders_h1.len(), 1);
+    assert_eq!(orders_h1[0].side, OrderSide::Buy);
+    assert_eq!(orders_h1[0].symbol_id, xaut_id);
+    assert_eq!(orders_h1[0].symbol.as_str(), "XAUTUSDT");
+    assert_eq!(orders_h1[0].quote_spend_1e8, Money1e8(1_215_343_000));
+
+    let gross_base = Qty1e8(mul_div_floor_nonneg(
+        orders_h1[0].quote_spend_1e8.raw(),
+        SCALE_1E8,
+        prices[xaut_id.index()].raw(),
+    )?);
+    let fee_base = Qty1e8(mul_div_floor_nonneg(gross_base.raw(), 10, 10_000)?);
+    ledger.apply_buy_fill(
+        xaut_id,
+        orders_h1[0].quote_spend_1e8,
+        gross_base,
+        fee_base,
+        rules[xaut_id.index()].base_precision,
+    )?;
+
+    assert_eq!(ledger.position(xaut_id)?.qty_1e8, Qty1e8(485_000)); // 0.00485 XAUT ($12.125 MTM)
+    assert_eq!(ledger.drift_book_1e8()?, 0);
+    assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+
+    let w_post_h1 = ledger.current_weights(&prices)?;
+    assert!(
+        w_post_h1[xaut_id.index()] > (500_000_000.0 / 106_000_000_000.0)
+            && w_post_h1[xaut_id.index()] < 0.020,
+        "expected XAUT weight strictly in ($5/$1060, 0.020), got {}",
+        w_post_h1[xaut_id.index()]
+    );
+
+    // Hour 2: XAUT target drops to 0.0 -> full liquidation of ~1.14% position
+    let target_h2 = [0.17, 0.17, 0.17, 0.17, 0.17, 0.0];
+    let orders_h2 = plan_rebalance_orders(&RebalancePlanInput {
+        universe: &universe,
+        cash_1e8: ledger.cash_1e8(),
+        positions: ledger.positions(),
+        prices_1e8: &prices,
+        rules: &rules,
+        target_weights: &target_h2,
+        current_weights: &w_post_h1,
+        fee_rate: DEFAULT_SPOT_FEE_RATE,
+        allow_buys: true,
+    })?;
+    assert_eq!(orders_h2.len(), 1);
+    assert_eq!(orders_h2[0].side, OrderSide::Sell);
+    assert_eq!(orders_h2[0].symbol_id, xaut_id);
+    assert_eq!(orders_h2[0].symbol.as_str(), "XAUTUSDT");
+    assert!(orders_h2[0].full_liquidation);
+    assert_eq!(orders_h2[0].base_qty_1e8, Qty1e8(485_000));
+    assert_eq!(orders_h2[0].quote_spend_1e8, Money1e8(1_212_500_000));
+
+    let sell_fee_usdt = Money1e8(mul_div_round(
+        orders_h2[0].quote_spend_1e8.raw(),
+        10,
+        10_000,
+    )?);
+    ledger.apply_sell_fill(
+        xaut_id,
+        "XAUTUSDT",
+        orders_h2[0].base_qty_1e8,
+        orders_h2[0].quote_spend_1e8,
+        sell_fee_usdt,
+    )?;
+
+    assert_eq!(ledger.position(xaut_id)?.qty_1e8, Qty1e8::ZERO);
+    assert_eq!(
+        ledger.position(xaut_id)?.cost_basis_usdt_1e8,
+        Money1e8::ZERO
+    );
+    assert_eq!(ledger.drift_book_1e8()?, 0);
+    assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+
+    Ok(())
+}
+
+#[test]
+fn sub_minimum_dust_0_06_usdt_zero_churn_across_consecutive_cycles_zero_drift() -> TestResult {
+    let universe = Universe::default_universe()?;
+    let n = universe.len();
+    let sol_id = SymbolId(2);
+    let avax_id = SymbolId(4);
+
+    let rules: Vec<InstrumentRules> = universe
+        .symbols()
+        .iter()
+        .map(|sym| mk_rule(sym, 100_000, 100_000, 500_000_000)) // step 0.001, min_qty 0.001, min_amt $5.00
+        .collect();
+
+    let prices = vec![
+        Price1e8(10_000_000_000),  // BTC = $100.00
+        Price1e8(10_000_000_000),  // ETH = $100.00
+        Price1e8(10_000_000_000),  // SOL = $100.00
+        Price1e8(1_000_000_000),   // LINK = $10.00
+        Price1e8(2_000_000_000),   // AVAX = $20.00
+        Price1e8(250_000_000_000), // XAUT = $2,500.00
+    ];
+
+    let mut positions = vec![PositionState::default(); n];
+    positions[avax_id.index()] = PositionState {
+        qty_1e8: Qty1e8(300_000), // 0.003 AVAX ($0.06 < $5.00 min_order_amt)
+        cost_basis_usdt_1e8: Money1e8(6_000_000),
+    };
+    positions[sol_id.index()] = PositionState {
+        qty_1e8: Qty1e8(50_000), // 0.0005 SOL (< 0.001 base_precision, $0.05)
+        cost_basis_usdt_1e8: Money1e8(5_000_000),
+    };
+
+    let mut ledger = SpotPortfolioLedger::from_snapshot(
+        PortfolioSnapshot {
+            cash_1e8: Money1e8(105_989_000_000), // $1,059.89
+            positions,
+            total_deposits_1e8: Money1e8(106_000_000_000), // $1,060.00
+            realized_pnl_gross_1e8: Money1e8::ZERO,
+            cum_sell_fees_usdt_1e8: Money1e8::ZERO,
+            cum_buy_fees_base_1e8: vec![Qty1e8::ZERO; n],
+            cum_buy_fees_usdt_est_1e8: Money1e8::ZERO,
+            twr_index_1e10: Rate1e10::ONE,
+            twr_peak_1e10: Rate1e10::ONE,
+            last_marked_equity_1e8: Money1e8(106_000_000_000),
+            halted: false,
+        },
+        n,
+    )?;
+    assert_eq!(ledger.drift_book_1e8()?, 0);
+    assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
+
+    let target_zero = [0.0; 6];
+    for _cycle in 0..5 {
+        assert!(ledger.mark_to_market(&prices)?.is_none());
+        let current_w = ledger.current_weights(&prices)?;
+        let orders = plan_rebalance_orders(&RebalancePlanInput {
+            universe: &universe,
+            cash_1e8: ledger.cash_1e8(),
+            positions: ledger.positions(),
+            prices_1e8: &prices,
+            rules: &rules,
+            target_weights: &target_zero,
+            current_weights: &current_w,
+            fee_rate: DEFAULT_SPOT_FEE_RATE,
+            allow_buys: true,
+        })?;
+        assert!(
+            orders.is_empty(),
+            "sub-minimum dust must produce zero churn"
+        );
+        assert_eq!(ledger.position(avax_id)?.qty_1e8, Qty1e8(300_000));
+        assert_eq!(ledger.position(sol_id)?.qty_1e8, Qty1e8(50_000));
         assert_eq!(ledger.drift_book_1e8()?, 0);
         assert_eq!(ledger.drift_mtm_1e8(&prices)?, 0);
     }

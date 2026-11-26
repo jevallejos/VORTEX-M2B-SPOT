@@ -1758,3 +1758,223 @@ fn config_env_universe_parsing_defaults_and_fail_closed() -> TestResult {
 
     Ok(())
 }
+
+fn sorted_state_key_sets(
+    raw_json: &str,
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+    let val: serde_json::Value = serde_json::from_str(raw_json)?;
+    let root_obj = val.as_object().ok_or("expected JSON root object")?;
+    let mut root_keys: Vec<String> = root_obj.keys().cloned().collect();
+    root_keys.sort();
+
+    let portfolio_obj = root_obj
+        .get("portfolio")
+        .and_then(|v| v.as_object())
+        .ok_or("expected JSON portfolio object")?;
+    let mut portfolio_keys: Vec<String> = portfolio_obj.keys().cloned().collect();
+    portfolio_keys.sort();
+
+    Ok((root_keys, portfolio_keys))
+}
+
+#[test]
+fn hot_load_v110_schema_v2_state_runs_1h_and_4h_and_liquidates_sub_2pct_positions() -> TestResult {
+    let universe = Universe::default_universe()?;
+    let n = universe.len();
+    let dir = TempDirGuard::create("hot_load_v110_v2")?;
+    let store = FsStateStore::new(dir.path().join("state"), dir.path().join("logs"))?;
+
+    // Literal v1.1.0 primary_state.json (schema_version=2, 6 default pairs, LINK=1.602%, XAUT=1.153%)
+    let v110_primary_json = r#"{
+  "schema_version": 2,
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT", "XAUTUSDT"],
+  "mode": "paper",
+  "last_processed_hour_ts_ms": 1730170800000,
+  "last_daily_summary_day_utc": 20025,
+  "last_order_ts_ms": 0,
+  "portfolio": {
+    "cash_1e8": 103079268000,
+    "positions": [
+      {"qty_1e8": 0, "cost_basis_usdt_1e8": 0},
+      {"qty_1e8": 0, "cost_basis_usdt_1e8": 0},
+      {"qty_1e8": 0, "cost_basis_usdt_1e8": 0},
+      {"qty_1e8": 10000000, "cost_basis_usdt_1e8": 1698100000},
+      {"qty_1e8": 0, "cost_basis_usdt_1e8": 0},
+      {"qty_1e8": 7200000, "cost_basis_usdt_1e8": 1222632000}
+    ],
+    "total_deposits_1e8": 106000000000,
+    "realized_pnl_gross_1e8": 0,
+    "cum_sell_fees_usdt_1e8": 0,
+    "cum_buy_fees_base_1e8": [0, 0, 0, 0, 0, 0],
+    "cum_buy_fees_usdt_est_1e8": 0,
+    "twr_index_1e10": 10000000000,
+    "twr_peak_1e10": 10000000000,
+    "last_marked_equity_1e8": 106000000000,
+    "halted": false
+  },
+  "last_target_weights": [0.0, 0.0, 0.0, 0.016, 0.0, 0.0115],
+  "last_current_weights": [0.0, 0.0, 0.0, 0.016019811320754717, 0.0, 0.011534264150943396],
+  "last_sigma_ann": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+  "last_tsmom": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "last_prices_1e8": [16981000000, 16981000000, 16981000000, 16981000000, 16981000000, 16981000000],
+  "last_drift_1e8": 0
+}"#;
+
+    // Literal v1.1.0 m2b_shadow_4h_state.json (schema_version=2, 6 default pairs, XAUT=1.153%)
+    let v110_shadow_json = r#"{
+  "schema_version": 2,
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT", "XAUTUSDT"],
+  "last_processed_4h_close_ts_ms": 1730160000000,
+  "portfolio": {
+    "cash_1e8": 104777368000,
+    "positions": [
+      {"qty_1e8": 0, "cost_basis_usdt_1e8": 0},
+      {"qty_1e8": 0, "cost_basis_usdt_1e8": 0},
+      {"qty_1e8": 0, "cost_basis_usdt_1e8": 0},
+      {"qty_1e8": 0, "cost_basis_usdt_1e8": 0},
+      {"qty_1e8": 0, "cost_basis_usdt_1e8": 0},
+      {"qty_1e8": 7200000, "cost_basis_usdt_1e8": 1222632000}
+    ],
+    "total_deposits_1e8": 106000000000,
+    "realized_pnl_gross_1e8": 0,
+    "cum_sell_fees_usdt_1e8": 0,
+    "cum_buy_fees_base_1e8": [0, 0, 0, 0, 0, 0],
+    "cum_buy_fees_usdt_est_1e8": 0,
+    "twr_index_1e10": 10000000000,
+    "twr_peak_1e10": 10000000000,
+    "last_marked_equity_1e8": 106000000000,
+    "halted": false
+  },
+  "last_target_weights": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0115],
+  "last_current_weights": [0.0, 0.0, 0.0, 0.0, 0.0, 0.011534264150943396],
+  "last_sigma_ann": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+  "last_tsmom": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "last_prices_1e8": [16981000000, 16981000000, 16981000000, 16981000000, 16981000000, 16981000000],
+  "last_drift_1e8": 0
+}"#;
+
+    let primary_keys_v110 = sorted_state_key_sets(v110_primary_json)?;
+    let shadow_keys_v110 = sorted_state_key_sets(v110_shadow_json)?;
+
+    fs::write(store.primary_state_path(), v110_primary_json)?;
+    fs::write(store.shadow_4h_state_path(), v110_shadow_json)?;
+
+    let pre_primary = store
+        .load_primary_state(&universe)?
+        .ok_or("preloaded v1.1.0 primary_state.json missing")?;
+    assert_eq!(
+        pre_primary.last_processed_hour_ts_ms,
+        BASE_UTC_MIDNIGHT_MS + 603 * ONE_HOUR_MS
+    );
+    let pre_shadow = store
+        .load_shadow_4h_state(&universe)?
+        .ok_or("preloaded v1.1.0 m2b_shadow_4h_state.json missing")?;
+    assert_eq!(
+        pre_shadow.last_processed_4h_close_ts_ms,
+        BASE_UTC_MIDNIGHT_MS + 600 * ONE_HOUR_MS
+    );
+
+    // Cycle 1 at exact 4h UTC boundary (604h): mild downtrend -> target_weights = [0.0; 6]
+    let hour_04_close = BASE_UTC_MIDNIGHT_MS + 604 * ONE_HOUR_MS;
+    let clock = MockClock::new(hour_04_close + 1_000);
+    let market = MockMarket::new(
+        universe.clone(),
+        hour_04_close + 1_000,
+        build_universe(n, 604, 0),
+    );
+    let exec = SpyExecutionPort::default();
+    let notifier = SpyNotifier::default();
+    let uc = RunHourlyCycleUseCase::new(&clock, &market, &exec, &store, &notifier);
+
+    let mut cfg = paper_cfg(universe.clone());
+    cfg.paper_initial_cash_1e8 = Money1e8(106_000_000_000);
+
+    let out_04 = uc.run(&cfg)?;
+    match out_04 {
+        CycleOutcome::Executed {
+            closed_hour_ts_ms,
+            orders_executed,
+            drift_1e8,
+            shadow_4h_updated,
+            halted,
+            drain_mode,
+            ..
+        } => {
+            assert_eq!(closed_hour_ts_ms, hour_04_close);
+            assert_eq!(orders_executed, 2);
+            assert_eq!(drift_1e8, 0);
+            assert!(shadow_4h_updated);
+            assert!(!halted);
+            assert!(!drain_mode);
+        }
+        other => return Err(format!("expected Executed at hour_04_close, got {other:?}").into()),
+    }
+
+    let reloaded_primary = store
+        .load_primary_state(&universe)?
+        .ok_or("reloaded primary_state.json missing")?;
+    assert_eq!(reloaded_primary.schema_version, STATE_SCHEMA_VERSION);
+    assert_eq!(reloaded_primary.schema_version, 2);
+    assert_eq!(
+        reloaded_primary.portfolio.positions[3].qty_1e8,
+        Qty1e8::ZERO
+    );
+    assert_eq!(
+        reloaded_primary.portfolio.positions[5].qty_1e8,
+        Qty1e8::ZERO
+    );
+    assert_eq!(reloaded_primary.last_drift_1e8, 0);
+    let primary_after_raw = fs::read_to_string(store.primary_state_path())?;
+    assert_eq!(
+        sorted_state_key_sets(&primary_after_raw)?,
+        primary_keys_v110
+    );
+
+    let reloaded_shadow = store
+        .load_shadow_4h_state(&universe)?
+        .ok_or("reloaded m2b_shadow_4h_state.json missing")?;
+    assert_eq!(reloaded_shadow.schema_version, STATE_SCHEMA_VERSION);
+    assert_eq!(reloaded_shadow.schema_version, 2);
+    assert_eq!(reloaded_shadow.last_processed_4h_close_ts_ms, hour_04_close);
+    assert_eq!(reloaded_shadow.portfolio.positions[5].qty_1e8, Qty1e8::ZERO);
+    assert_eq!(reloaded_shadow.last_drift_1e8, 0);
+    let shadow_after_raw = fs::read_to_string(store.shadow_4h_state_path())?;
+    assert_eq!(sorted_state_key_sets(&shadow_after_raw)?, shadow_keys_v110);
+
+    let raw_ledger = fs::read_to_string(store.audit_ledger_path())?;
+    let lines: Vec<&str> = raw_ledger.lines().collect();
+    assert!(!lines.is_empty());
+    for line in &lines {
+        assert!(verify_audit_ledger_line(line)?);
+        assert!(line.contains("\"drift_1e8\":0"));
+    }
+
+    // Cycle 2 at 605h: already flat with target_weights = [0.0; 6] -> 0 orders, 0 drift
+    let hour_05_close = BASE_UTC_MIDNIGHT_MS + 605 * ONE_HOUR_MS;
+    clock.set(hour_05_close + 1_000)?;
+    market.set_state(hour_05_close + 1_000, build_universe(n, 605, 0))?;
+
+    let out_05 = uc.run(&cfg)?;
+    match out_05 {
+        CycleOutcome::Executed {
+            closed_hour_ts_ms,
+            orders_executed,
+            drift_1e8,
+            shadow_4h_updated,
+            halted,
+            drain_mode,
+            ..
+        } => {
+            assert_eq!(closed_hour_ts_ms, hour_05_close);
+            assert_eq!(orders_executed, 0);
+            assert_eq!(drift_1e8, 0);
+            assert!(!shadow_4h_updated);
+            assert!(!halted);
+            assert!(!drain_mode);
+        }
+        other => return Err(format!("expected Executed at hour_05_close, got {other:?}").into()),
+    }
+    assert_eq!(exec.total_calls(), 0);
+
+    Ok(())
+}

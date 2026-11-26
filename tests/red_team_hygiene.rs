@@ -238,13 +238,13 @@ fn gitignore_env_example_and_secret_hygiene() -> TestResult {
 }
 
 #[test]
-fn v110_release_metadata_and_v102_regression_guards() -> TestResult {
+fn v111_release_metadata_and_regression_guards() -> TestResult {
     let root = repo_root();
 
     let cargo_toml = fs::read_to_string(root.join("Cargo.toml"))?;
     assert!(
-        cargo_toml.contains("version = \"1.1.0\""),
-        "Cargo.toml must specify version = \"1.1.0\""
+        cargo_toml.contains("version = \"1.1.1\""),
+        "Cargo.toml must specify version = \"1.1.1\""
     );
 
     let timer = fs::read_to_string(root.join("deploy").join("vortex-m2b-spot.timer"))?;
@@ -274,6 +274,20 @@ fn v110_release_metadata_and_v102_regression_guards() -> TestResult {
     let types_rs = fs::read_to_string(root.join("src").join("domain").join("types.rs"))?;
     assert!(types_rs.contains("pub const STATE_SCHEMA_VERSION: u32 = 2;"));
     assert!(types_rs.contains("XAUTUSDT"));
+
+    let strategy_rs = fs::read_to_string(root.join("src").join("domain").join("strategy.rs"))?;
+    assert!(
+        !strategy_rs.contains("LIQUIDATE_CURRENT_THRESH"),
+        "v1.1.1 must remove LIQUIDATE_CURRENT_THRESH liquidation slit"
+    );
+    assert!(
+        strategy_rs.contains("pub const LIQUIDATE_TARGET_THRESH: f64 = 0.015;"),
+        "strategy.rs must preserve pub const LIQUIDATE_TARGET_THRESH: f64 = 0.015;"
+    );
+    assert!(
+        strategy_rs.contains("target_w < LIQUIDATE_TARGET_THRESH && current_w > 0.0"),
+        "strategy.rs must liquidate any positive weight when target_w < LIQUIDATE_TARGET_THRESH"
+    );
 
     Ok(())
 }

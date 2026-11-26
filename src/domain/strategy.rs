@@ -16,7 +16,6 @@ pub const VOL_FLOOR_ANN: f64 = 0.15;
 pub const DEADBAND_DELTA: f64 = 0.20;
 pub const DEADBAND: f64 = 0.08;
 pub const LIQUIDATE_TARGET_THRESH: f64 = 0.015;
-pub const LIQUIDATE_CURRENT_THRESH: f64 = 0.02;
 pub const BUY_SLIP_RESERVE_BPS: i128 = 30;
 pub const MIN_CLOSED_1H_CANDLES: usize = 600;
 pub const MIN_CLOSED_4H_CANDLES: usize = 147;
@@ -307,7 +306,7 @@ pub fn compute_a0_4h_signals(
 #[inline]
 pub fn should_rebalance(target_w: f64, current_w: f64) -> bool {
     (target_w - current_w).abs() >= DEADBAND
-        || (target_w < LIQUIDATE_TARGET_THRESH && current_w >= LIQUIDATE_CURRENT_THRESH)
+        || (target_w < LIQUIDATE_TARGET_THRESH && current_w > 0.0)
 }
 
 fn check_slice_len(field: &'static str, expected: usize, actual: usize) -> Result<(), DomainError> {
@@ -407,7 +406,9 @@ pub fn plan_rebalance_orders(
         let current_val_1e8 = pos_vals_1e8[i];
         let raw_target_w = input.target_weights[i];
         let current_w = input.current_weights[i];
-        if !should_rebalance(raw_target_w, current_w) {
+        let pos_qty = input.positions[i].qty_1e8;
+        let liquidate_open_pos = raw_target_w < LIQUIDATE_TARGET_THRESH && pos_qty.0 > 0;
+        if !should_rebalance(raw_target_w, current_w) && !liquidate_open_pos {
             continue;
         }
 
@@ -419,7 +420,6 @@ pub fn plan_rebalance_orders(
 
         let rule = &input.rules[i];
         let price = input.prices_1e8[i];
-        let pos_qty = input.positions[i].qty_1e8;
 
         if target_w == 0.0 {
             let sellable = pos_qty.floor_to_step(rule.base_precision)?;
@@ -706,6 +706,151 @@ mod tests {
         let sig_4h = compute_a0_4h_signals(&universe_4h)?;
         assert_eq!(sig_4h.target_weights.len(), 6);
         assert!(sig_4h.tsmom[0] > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn should_rebalance_liquidates_any_positive_weight_below_target_thresh(
+    ) -> Result<(), DomainError> {
+        assert!(!should_rebalance(0.0, 0.0));
+        assert!(!should_rebalance(0.0149, 0.0));
+        assert!(should_rebalance(0.0, 0.0001));
+        assert!(should_rebalance(0.0, 0.0115));
+        assert!(should_rebalance(0.0, 0.016));
+        assert!(should_rebalance(0.0149, 0.016));
+        assert!(!should_rebalance(0.015, 0.016));
+        assert!(should_rebalance(0.016, 0.096));
+        assert!(!should_rebalance(0.05, 0.01));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_rebalance_liquidates_sub_2pct_tradable_and_skips_dust_without_churn(
+    ) -> Result<(), DomainError> {
+        let universe = Universe::default_universe()?;
+        let n = universe.len();
+        assert_eq!(n, 6);
+
+        let rules: Vec<InstrumentRules> = universe
+            .symbols()
+            .iter()
+            .map(|sym| InstrumentRules {
+                symbol: sym.clone(),
+                base_precision: Qty1e8(100_000),      // 0.001
+                quote_precision: Money1e8(1_000_000), // 0.01
+                min_order_qty: Qty1e8(100_000),       // 0.001
+                min_order_amt: Money1e8(500_000_000), // 5.00 USDT
+                tick_size: Price1e8(1_000_000),       // 0.01
+                is_trading: true,
+            })
+            .collect();
+
+        // Price = $10.00 across all 6 pairs so 0.001 qty steps map cleanly to $0.01 multiples.
+        let prices = vec![Price1e8(1_000_000_000); n];
+
+        let mut positions = vec![PositionState::default(); n];
+        // Pair 0 (BTCUSDT): $16.96 (1.60% of $1,060.00), target_w = 0.0 -> 100% Sell.
+        positions[0] = PositionState {
+            qty_1e8: Qty1e8(169_600_000),
+            cost_basis_usdt_1e8: Money1e8(1_696_000_000),
+        };
+        // Pair 1 (ETHUSDT): $12.15 (~1.15% of $1,060.00), target_w = 0.014 -> 100% Sell.
+        positions[1] = PositionState {
+            qty_1e8: Qty1e8(121_500_000),
+            cost_basis_usdt_1e8: Money1e8(1_215_000_000),
+        };
+        // Pair 2 (SOLUSDT): $0.06 (< $5.00 min_order_amt) dust, target_w = 0.0 -> skipped.
+        positions[2] = PositionState {
+            qty_1e8: Qty1e8(600_000),
+            cost_basis_usdt_1e8: Money1e8(6_000_000),
+        };
+        // Pair 3 (LINKUSDT): $10.00 open qty > 0 with current_w = 0.0, target_w = 0.0 -> 100% Sell.
+        positions[3] = PositionState {
+            qty_1e8: Qty1e8(100_000_000),
+            cost_basis_usdt_1e8: Money1e8(1_000_000_000),
+        };
+
+        let total_equity_1e8: i128 = 106_000_000_000; // $1,060.00
+        let mut pos_equity_1e8 = 0i128;
+        let mut current_weights = vec![0.0; n];
+        for i in 0..n {
+            let pos_val_1e8 = mul_div_floor_nonneg(positions[i].qty_1e8.0, prices[i].0, SCALE_1E8)?;
+            pos_equity_1e8 = pos_equity_1e8
+                .checked_add(pos_val_1e8)
+                .ok_or(DomainError::ArithmeticOverflow)?;
+            if i != 3 {
+                current_weights[i] = (pos_val_1e8 as f64) / (total_equity_1e8 as f64);
+            }
+        }
+        assert_eq!(current_weights[3], 0.0);
+
+        let cash_1e8 = Money1e8(
+            total_equity_1e8
+                .checked_sub(pos_equity_1e8)
+                .ok_or(DomainError::ArithmeticOverflow)?,
+        );
+        assert_eq!(cash_1e8.0 + pos_equity_1e8, total_equity_1e8);
+
+        let target_weights = [0.0, 0.014, 0.0, 0.0, 0.0, 0.0];
+        let input = RebalancePlanInput {
+            universe: &universe,
+            cash_1e8,
+            positions: &positions,
+            prices_1e8: &prices,
+            rules: &rules,
+            target_weights: &target_weights,
+            current_weights: &current_weights,
+            fee_rate: Rate1e10::from_bps(10),
+            allow_buys: true,
+        };
+
+        let orders = plan_rebalance_orders(&input)?;
+        assert_eq!(orders.len(), 3);
+
+        // Order 0: Pair 0 ($16.96, 1.60%) -> 100% Sell
+        assert_eq!(orders[0].symbol_id, SymbolId(0));
+        assert_eq!(orders[0].side, OrderSide::Sell);
+        assert!(orders[0].full_liquidation);
+        assert_eq!(orders[0].base_qty_1e8, Qty1e8(169_600_000));
+        assert_eq!(orders[0].quote_spend_1e8, Money1e8(1_696_000_000));
+        assert_eq!(orders[0].target_weight, 0.0);
+
+        // Order 1: Pair 1 ($12.15, ~1.15%, target_w = 0.014) -> 100% Sell
+        assert_eq!(orders[1].symbol_id, SymbolId(1));
+        assert_eq!(orders[1].side, OrderSide::Sell);
+        assert!(orders[1].full_liquidation);
+        assert_eq!(orders[1].base_qty_1e8, Qty1e8(121_500_000));
+        assert_eq!(orders[1].quote_spend_1e8, Money1e8(1_215_000_000));
+        assert_eq!(orders[1].target_weight, 0.0);
+
+        // Order 2: Pair 3 ($10.00, current_w = 0.0, pos_qty > 0) -> 100% Sell
+        assert_eq!(orders[2].symbol_id, SymbolId(3));
+        assert_eq!(orders[2].side, OrderSide::Sell);
+        assert!(orders[2].full_liquidation);
+        assert_eq!(orders[2].base_qty_1e8, Qty1e8(100_000_000));
+        assert_eq!(orders[2].quote_spend_1e8, Money1e8(1_000_000_000));
+        assert_eq!(orders[2].target_weight, 0.0);
+
+        // Pair 2 ($0.06 dust) must not emit any order and must not churn on subsequent cycles.
+        assert!(orders.iter().all(|o| o.symbol_id != SymbolId(2)));
+
+        let mut dust_only_positions = vec![PositionState::default(); n];
+        dust_only_positions[2] = positions[2];
+        let dust_only_weights = [0.0, 0.0, current_weights[2], 0.0, 0.0, 0.0];
+        let dust_only_input = RebalancePlanInput {
+            universe: &universe,
+            cash_1e8: Money1e8(total_equity_1e8 - 6_000_000),
+            positions: &dust_only_positions,
+            prices_1e8: &prices,
+            rules: &rules,
+            target_weights: &[0.0; 6],
+            current_weights: &dust_only_weights,
+            fee_rate: Rate1e10::from_bps(10),
+            allow_buys: true,
+        };
+        let dust_only_orders = plan_rebalance_orders(&dust_only_input)?;
+        assert!(dust_only_orders.is_empty());
+
         Ok(())
     }
 }
